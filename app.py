@@ -57,6 +57,19 @@ REQUIRED_FIELDS = [
     "ifsc_code",
 ]
 
+@app.get("/vendors")
+def get_vendors():
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM vendor")
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+    except MySQLError as err:
+        return jsonify({"error": str(err)}), 500
+
+    return jsonify(rows), 200
 
 @app.post("/vendors")
 def create_vendor():
