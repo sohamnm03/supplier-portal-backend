@@ -153,6 +153,36 @@ def approve_vendor():
     except MySQLError as err:
         return jsonify({"error": str(err)}), 500
 
+@app.post("/vendors/check-email")
+def check_vendor_email():
+    data = request.get_json(silent=True) or {}
+
+    email = data.get("email")
+    if not email:
+        return jsonify({"error": "email is required"}), 400
+
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        cursor.execute(
+            "SELECT vendor_id FROM vendor WHERE email = %s",
+            (email,),
+        )
+        vendor = cursor.fetchone()
+
+        cursor.close()
+        conn.close()
+
+        if vendor:
+            return jsonify({"message": "Email exists", "code": 200, "data": []}), 200
+        else:
+            return jsonify({"message": "Email not found", "code": 200, "data": []}), 200
+
+    except MySQLError as err:
+        return jsonify({"error": str(err)}), 500
+
+
 
 if __name__ == "__main__":
     app.run(debug=True)
