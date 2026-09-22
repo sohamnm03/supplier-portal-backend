@@ -175,13 +175,41 @@ def check_vendor_email():
         conn.close()
 
         if vendor:
-            return jsonify({"message": "Email exists", "code": 200, "data": []}), 200
+            return jsonify({"message": "Email exists", "code": 200,"exists": True, "data": []}), 200
         else:
-            return jsonify({"message": "Email not found", "code": 200, "data": []}), 200
+            return jsonify({"message": "Email not found", "code": 200, "exists": False, "data": []}), 200
 
     except MySQLError as err:
         return jsonify({"error": str(err)}), 500
 
+@app.post("/vendors/check-pan")
+def check_vendor_pan():
+    data = request.get_json(silent=True) or {}
+
+    pan = data.get("pan")
+    if not pan:
+        return jsonify({"error": "pan is required"}), 400
+        
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        cursor.execute(
+            "SELECT vendor_id FROM vendor WHERE pan = %s",
+            (pan,),
+        )
+        vendor = cursor.fetchone()
+
+        cursor.close()
+        conn.close()
+
+        if vendor:
+            return jsonify({"message": "PAN exists", "code": 200,"exists": True, "data": []}), 200
+        else:
+            return jsonify({"message": "PAN not found", "code": 200, "exists": False, "data": []}), 200
+
+    except MySQLError as err:
+        return jsonify({"error": str(err)}), 500
 
 
 if __name__ == "__main__":
