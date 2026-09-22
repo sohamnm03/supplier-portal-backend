@@ -1,3 +1,6 @@
+import hashlib
+import secrets
+
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from mysql.connector import Error as MySQLError
@@ -56,6 +59,23 @@ REQUIRED_FIELDS = [
     "bank_account_no",
     "ifsc_code",
 ]
+
+
+def generate_unique_password(cursor):
+    """Return a six-digit password and its unused SHA-256 hash."""
+    for _ in range(100):
+        password = f"{secrets.randbelow(1_000_000):06d}"
+        password_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+        cursor.execute(
+            "SELECT 1 FROM vendor WHERE password = %s LIMIT 1",
+            (password_hash,),
+        )
+        if cursor.fetchone() is None:
+            return password, password_hash
+
+    raise RuntimeError("Unable to generate a unique vendor password")
+
 
 @app.get("/vendors")
 def get_vendors():
@@ -121,7 +141,7 @@ def approve_vendor():
         cursor = conn.cursor(dictionary=True)
 
         cursor.execute(
-            "SELECT vendor_id FROM vendor WHERE vendor_id = %s",
+            "SELECT vendor_id, email FROM vendor WHERE vendor_id = %s",
             (vendor_id,),
         )
         vendor = cursor.fetchone()
@@ -132,9 +152,10 @@ def approve_vendor():
             return jsonify({"error": "Vendor not found"}), 404
 
         if isapproved is True:
+            password, password_hash = generate_unique_password(cursor)
             cursor.execute(
-                "UPDATE vendor SET status = %s WHERE vendor_id = %s",
-                ("active", vendor_id),
+                "UPDATE vendor SET status = %s, password = %s WHERE vendor_id = %s",
+                ("active", password_hash, vendor_id),
             )
             conn.commit()
             message = "Vendor approved successfully"
@@ -144,13 +165,18 @@ def approve_vendor():
         cursor.close()
         conn.close()
 
-        return jsonify({
+        response = {
             "message": message,
             "vendor_id": vendor_id,
+            "email": vendor["email"],
             "isapproved": isapproved,
-        }), 200
+        }
+        if isapproved is True:
+            response["password"] = password
 
-    except MySQLError as err:
+        return jsonify(response), 200
+
+    except (MySQLError, RuntimeError) as err:
         return jsonify({"error": str(err)}), 500
 
 @app.post("/vendors/check-email")
