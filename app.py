@@ -106,6 +106,53 @@ def create_vendor():
 
     return jsonify(row), 201
 
+@app.post("/vendors/approval")
+def approve_vendor():
+    data = request.get_json(silent=True) or {}
+
+    vendor_id = data.get("vendor_id")
+    isapproved = data.get("isapproved")
+
+    if vendor_id is None:
+        return jsonify({"error": "vendor_id is required"}), 400
+
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        cursor.execute(
+            "SELECT vendor_id FROM vendor WHERE vendor_id = %s",
+            (vendor_id,),
+        )
+        vendor = cursor.fetchone()
+
+        if not vendor:
+            cursor.close()
+            conn.close()
+            return jsonify({"error": "Vendor not found"}), 404
+
+        if isapproved is True:
+            cursor.execute(
+                "UPDATE vendor SET status = %s WHERE vendor_id = %s",
+                ("active", vendor_id),
+            )
+            conn.commit()
+            message = "Vendor approved successfully"
+        else:
+            message = "Vendor remains pending"
+
+        cursor.close()
+        conn.close()
+
+        return jsonify({
+            "message": message,
+            "vendor_id": vendor_id,
+            "isapproved": isapproved,
+        }), 200
+
+    except MySQLError as err:
+        return jsonify({"error": str(err)}), 500
+
 
 if __name__ == "__main__":
     app.run(debug=True)
