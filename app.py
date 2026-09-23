@@ -158,67 +158,6 @@ def get_vendors():
     return jsonify(rows), 200
 
 
-@app.patch("/vendors/<int:vendor_id>")
-def update_vendor_profile(vendor_id):
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        return jsonify({"error": "Request body must be JSON"}), 400
-
-    editable_fields = {
-        "vendor_legal_name", "email", "contact_no", "vendor_type",
-        "vendor_category", "vendor_subcategory", "registration_number",
-        "gstin", "pan", "street", "city", "district", "region", "postal_code",
-    }
-    values = {key: data[key] for key in editable_fields if key in data}
-    if not values:
-        return jsonify({"error": "No editable vendor fields were provided"}), 400
-
-    for key, value in values.items():
-        if isinstance(value, str):
-            values[key] = value.strip()
-    if "email" in values:
-        values["email"] = values["email"].lower()
-    if "pan" in values:
-        values["pan"] = values["pan"].upper()
-    if "gstin" in values:
-        values["gstin"] = values["gstin"].upper()
-    if "vendor_legal_name" in values:
-        values["name"] = values["vendor_legal_name"]
-
-    conn = None
-    cursor = None
-    try:
-        conn = get_connection()
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT vendor_id FROM vendor WHERE vendor_id = %s", (vendor_id,))
-        if cursor.fetchone() is None:
-            return jsonify({"error": "Vendor not found"}), 404
-
-        assignments = ", ".join(f"{column} = %s" for column in values)
-        cursor.execute(
-            f"UPDATE vendor SET {assignments} WHERE vendor_id = %s",
-            [*values.values(), vendor_id],
-        )
-        conn.commit()
-
-        columns = ", ".join(VENDOR_RESPONSE_FIELDS)
-        cursor.execute(
-            f"SELECT {columns} FROM vendor WHERE vendor_id = %s LIMIT 1",
-            (vendor_id,),
-        )
-        return jsonify(_serialize_row(cursor.fetchone())), 200
-    except MySQLError as err:
-        if conn is not None:
-            conn.rollback()
-        status = 409 if getattr(err, "errno", None) == 1062 else 500
-        message = "Email, PAN, or GSTIN is already in use" if status == 409 else str(err)
-        return jsonify({"error": message}), status
-    finally:
-        if cursor is not None:
-            cursor.close()
-        if conn is not None:
-            conn.close()
-
 @app.post("/vendors")
 def create_vendor():
     data = request.get_json(silent=True)
