@@ -124,10 +124,27 @@ def generate_unique_password(cursor):
 
 @app.get("/vendors")
 def get_vendors():
+    vendor_id = request.args.get("vendor_id")
+
     try:
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
         columns = ", ".join(VENDOR_RESPONSE_FIELDS)
+
+        if vendor_id:
+            cursor.execute(
+                f"SELECT {columns} FROM vendor WHERE vendor_id = %s",
+                (vendor_id,),
+            )
+            row = cursor.fetchone()
+            cursor.close()
+            conn.close()
+
+            if not row:
+                return jsonify({"error": "Vendor not found"}), 404
+
+            return jsonify(row), 200
+
         cursor.execute(f"SELECT {columns} FROM vendor")
         rows = cursor.fetchall()
         cursor.close()
