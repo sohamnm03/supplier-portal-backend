@@ -1,9 +1,7 @@
 import hashlib
 import hmac
-import os
 import secrets
 
-import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from mysql.connector import Error as MySQLError
@@ -12,11 +10,6 @@ from db import get_connection
 
 app = Flask(__name__)
 CORS(app, origins=["http://localhost:5173", "http://127.0.0.1:5173"])
-
-SAP_BUSINESS_PARTNER_URL = (
-    "https://vhnlqds4ap01.sap.niififl.in:44300/sap/opu/odata/SAP/"
-    "API_BUSINESS_PARTNER/A_BusinessPartner"
-)
 
 VENDOR_FIELDS = [
     "title",
@@ -91,84 +84,6 @@ def generate_unique_password(cursor):
             return password, password_hash
 
     raise RuntimeError("Unable to generate a unique vendor password")
-
-
-class SAPIntegrationError(RuntimeError):
-    """Raised when a business partner cannot be created in SAP."""
-
-
-def create_sap_business_partner(vendor_name):
-    username = os.environ.get("SAP_USERNAME")
-    password = os.environ.get("SAP_PASSWORD")
-    if not username or not password:
-        raise SAPIntegrationError("SAP credentials are not configured")
-
-    try:
-        timeout = int(os.environ.get("SAP_TIMEOUT_SECONDS", "30"))
-    except ValueError as err:
-        raise SAPIntegrationError("SAP_TIMEOUT_SECONDS must be an integer") from err
-
-    verify_ssl = os.environ.get("SAP_VERIFY_SSL", "true").lower() not in {
-        "0",
-        "false",
-        "no",
-    }
-    payload = {
-        "BusinessPartnerCategory": "2",
-        "BusinessPartnerGrouping": "9800",
-        "BusinessPartnerName": vendor_name,
-        "OrganizationBPName1": vendor_name,
-        "SearchTerm1": "ORICA",
-        "SearchTerm2": "FINANCE",
-        "CorrespondenceLanguage": "EN",
-    }
-
-    with requests.Session() as session:
-        session.auth = (username, password)
-        try:
-            token_response = session.get(
-                SAP_BUSINESS_PARTNER_URL,
-                headers={
-                    "Accept": "application/json",
-                    "X-CSRF-Token": "Fetch",
-                },
-                timeout=timeout,
-                verify=verify_ssl,
-            )
-            token_response.raise_for_status()
-
-            csrf_token = token_response.headers.get("X-CSRF-Token")
-            if not csrf_token:
-                raise SAPIntegrationError("SAP did not return an X-CSRF-Token")
-
-            create_response = session.post(
-                SAP_BUSINESS_PARTNER_URL,
-                headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",
-                    "X-CSRF-Token": csrf_token,
-                },
-                json=payload,
-                timeout=timeout,
-                verify=verify_ssl,
-            )
-            create_response.raise_for_status()
-        except requests.RequestException as err:
-            raise SAPIntegrationError(f"SAP request failed: {err}") from err
-
-        try:
-            response_data = create_response.json()
-        except ValueError as err:
-            raise SAPIntegrationError("SAP returned an invalid JSON response") from err
-
-    sap_data = response_data.get("d", response_data)
-    business_partner = sap_data.get("BusinessPartner")
-    if not business_partner:
-        raise SAPIntegrationError(
-            "SAP response did not contain a BusinessPartner value"
-        )
-
-    return str(business_partner)
 
 
 @app.get("/vendors")
@@ -248,11 +163,9 @@ def approve_vendor():
 
         if isapproved is True:
             password, password_hash = generate_unique_password(cursor)
-            sap_vendor = create_sap_business_partner(vendor["vendor_legal_name"])
             cursor.execute(
-                "UPDATE vendor SET status = %s, password = %s, sap_vendor = %s "
-                "WHERE vendor_id = %s",
-                ("active", password_hash, sap_vendor, vendor_id),
+                "UPDATE vendor SET status = %s, password = %s WHERE vendor_id = %s",
+                ("active", password_hash, vendor_id),
             )
             conn.commit()
             message = "Vendor approved successfully"
@@ -267,14 +180,9 @@ def approve_vendor():
         }
         if isapproved is True:
             response["password"] = password
-            response["sap_vendor"] = sap_vendor
 
         return jsonify(response), 200
 
-    except SAPIntegrationError as err:
-        if conn is not None:
-            conn.rollback()
-        return jsonify({"error": str(err)}), 502
     except (MySQLError, RuntimeError) as err:
         if conn is not None:
             conn.rollback()
