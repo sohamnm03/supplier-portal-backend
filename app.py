@@ -5,6 +5,7 @@ import secrets
 from datetime import date, datetime
 from decimal import Decimal
 
+import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from mysql.connector import Error as MySQLError
@@ -13,6 +14,8 @@ from db import get_connection
 
 app = Flask(__name__)
 CORS(app, origins=["http://localhost:5173", "http://127.0.0.1:5173"])
+
+EMAIL_API_URL = "http://127.0.0.1:8000/api/email/send"
 
 VENDOR_FIELDS = [
     "title",
@@ -206,6 +209,27 @@ def approve_vendor():
             )
             conn.commit()
             message = "Vendor approved successfully"
+
+            email_sent = True
+            try:
+                requests.post(
+                    EMAIL_API_URL,
+                    json={
+                        "to": vendor["email"],
+                        "subject": "Your vendor account is ready",
+                        "template_name": "vendor_account_onboarding",
+                        "params": {
+                            "vendor_name": vendor["vendor_legal_name"],
+                            "username": vendor["email"],
+                            "password": password,
+                            "login_url": "http://localhost:5173/",
+                            "support_email": "support@fourthsignal.com",
+                        },
+                    },
+                    timeout=10,
+                ).raise_for_status()
+            except requests.RequestException:
+                email_sent = False
         else:
             message = "Vendor remains pending"
 
@@ -217,6 +241,7 @@ def approve_vendor():
         }
         if isapproved is True:
             response["password"] = password
+            response["email_sent"] = email_sent
 
         return jsonify(response), 200
 
