@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import os
 import secrets
 
@@ -312,6 +313,52 @@ def check_vendor_email():
 
     except MySQLError as err:
         return jsonify({"error": str(err)}), 500
+
+
+@app.post("/vendors/login")
+def login_vendor():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be JSON"}), 400
+
+    email = data.get("email")
+    password = data.get("password")
+    if not isinstance(email, str) or not email.strip():
+        return jsonify({"error": "email is required"}), 400
+    if not isinstance(password, str) or not password:
+        return jsonify({"error": "password is required"}), 400
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT vendor_id, email, password FROM vendor "
+            "WHERE email = %s AND status = %s LIMIT 1",
+            (email.strip(), "active"),
+        )
+        vendor = cursor.fetchone()
+
+        submitted_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        stored_hash = vendor.get("password") if vendor else None
+        if not stored_hash or not hmac.compare_digest(str(stored_hash), submitted_hash):
+            return jsonify({"error": "Invalid email or password"}), 401
+
+        return jsonify(
+            {
+                "message": "Login successful",
+                "vendor_id": vendor["vendor_id"],
+                "email": vendor["email"],
+            }
+        ), 200
+    except MySQLError as err:
+        return jsonify({"error": str(err)}), 500
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
 
 @app.post("/vendors/check-pan")
 def check_vendor_pan():
