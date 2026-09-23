@@ -235,21 +235,22 @@ def check_vendor_email():
     data = request.get_json(silent=True) or {}
 
     email = data.get("email")
-    if not email:
+    if not isinstance(email, str) or not email.strip():
         return jsonify({"error": "email is required"}), 400
 
+    normalized_email = email.strip().lower()
+
+    conn = None
+    cursor = None
     try:
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
 
         cursor.execute(
-            "SELECT vendor_id FROM vendor WHERE email = %s",
-            (email,),
+            "SELECT vendor_id FROM vendor WHERE LOWER(TRIM(email)) = %s LIMIT 1",
+            (normalized_email,),
         )
         vendor = cursor.fetchone()
-
-        cursor.close()
-        conn.close()
 
         if vendor:
             return jsonify({"message": "Email exists", "code": 200,"exists": True, "data": []}), 200
@@ -258,6 +259,11 @@ def check_vendor_email():
 
     except MySQLError as err:
         return jsonify({"error": str(err)}), 500
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
 
 
 @app.post("/vendors/login")
@@ -310,21 +316,22 @@ def check_vendor_pan():
     data = request.get_json(silent=True) or {}
 
     pan = data.get("pan")
-    if not pan:
+    if not isinstance(pan, str) or not pan.strip():
         return jsonify({"error": "pan is required"}), 400
-        
+
+    normalized_pan = pan.strip().upper()
+
+    conn = None
+    cursor = None
     try:
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
 
         cursor.execute(
-            "SELECT vendor_id FROM vendor WHERE pan = %s",
-            (pan,),
+            "SELECT vendor_id FROM vendor WHERE UPPER(TRIM(pan)) = %s LIMIT 1",
+            (normalized_pan,),
         )
         vendor = cursor.fetchone()
-
-        cursor.close()
-        conn.close()
 
         if vendor:
             return jsonify({"message": "PAN exists", "code": 200,"exists": True, "data": []}), 200
@@ -333,6 +340,11 @@ def check_vendor_pan():
 
     except MySQLError as err:
         return jsonify({"error": str(err)}), 500
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
 
 
 @app.get("/invoices")
