@@ -1,6 +1,9 @@
 import hashlib
 import hmac
+import json
 import secrets
+from datetime import date, datetime
+from decimal import Decimal
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -50,6 +53,18 @@ VENDOR_RESPONSE_FIELDS = [
     "sap_vendor",
 ]
 
+INVOICE_JSON_FIELDS = {
+    "vendor_gstin_data",
+    "customer_gstin_data",
+    "matched_invoice_ids",
+    "duplicate_reasons",
+    "score_breakdown",
+    "duplicate_check_data",
+    "raw_response",
+}
+
+LINE_ITEM_JSON_FIELDS = {"raw_item_data"}
+
 REQUIRED_FIELDS = [
     "vendor_legal_name",
     "vendor_type",
@@ -68,6 +83,24 @@ REQUIRED_FIELDS = [
     "bank_account_no",
     "ifsc_code",
 ]
+
+
+def _serialize_row(row, json_fields=()):
+    """Convert DB-native types (Decimal, date/datetime, JSON text) to JSON-safe values."""
+    serialized = {}
+    for key, value in row.items():
+        if key in json_fields and isinstance(value, (str, bytes, bytearray)):
+            try:
+                serialized[key] = json.loads(value)
+            except (TypeError, ValueError):
+                serialized[key] = value
+        elif isinstance(value, Decimal):
+            serialized[key] = float(value)
+        elif isinstance(value, (datetime, date)):
+            serialized[key] = value.isoformat()
+        else:
+            serialized[key] = value
+    return serialized
 
 
 def generate_unique_password(cursor):
@@ -300,6 +333,69 @@ def check_vendor_pan():
 
     except MySQLError as err:
         return jsonify({"error": str(err)}), 500
+
+
+@app.get("/invoices")
+def get_invoices():
+    vendor_id = request.args.get("vendor_id")
+    if not vendor_id:
+        return jsonify({"error": "vendor_id is required"}), 400
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        cursor.execute(
+            "SELECT * FROM invoices WHERE vendor_id = %s ORDER BY id",
+            (vendor_id,),
+        )
+        invoices = cursor.fetchall()
+
+        if not invoices:
+            return jsonify([]), 200
+
+        invoice_ids = [invoice["id"] for invoice in invoices]
+        placeholders = ", ".join(["%s"] * len(invoice_ids))
+
+        cursor.execute(
+            f"SELECT * FROM invoice_tax_details WHERE invoice_id IN ({placeholders}) "
+            "ORDER BY id",
+            invoice_ids,
+        )
+        tax_details_by_invoice = {}
+        for row in cursor.fetchall():
+            tax_details_by_invoice.setdefault(row["invoice_id"], []).append(
+                _serialize_row(row, INVOICE_JSON_FIELDS)
+            )
+
+        cursor.execute(
+            f"SELECT * FROM invoice_line_items WHERE invoice_id IN ({placeholders}) "
+            "ORDER BY invoice_id, line_number",
+            invoice_ids,
+        )
+        line_items_by_invoice = {}
+        for row in cursor.fetchall():
+            line_items_by_invoice.setdefault(row["invoice_id"], []).append(
+                _serialize_row(row, LINE_ITEM_JSON_FIELDS)
+            )
+
+        result = []
+        for invoice in invoices:
+            serialized_invoice = _serialize_row(invoice, INVOICE_JSON_FIELDS)
+            serialized_invoice["tax_details"] = tax_details_by_invoice.get(invoice["id"], [])
+            serialized_invoice["line_items"] = line_items_by_invoice.get(invoice["id"], [])
+            result.append(serialized_invoice)
+    except MySQLError as err:
+        return jsonify({"error": str(err)}), 500
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+
+    return jsonify(result), 200
 
 
 if __name__ == "__main__":
