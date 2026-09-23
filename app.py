@@ -153,13 +153,17 @@ def approve_vendor():
         cursor = conn.cursor(dictionary=True)
 
         cursor.execute(
-            "SELECT vendor_id, email, vendor_legal_name FROM vendor WHERE vendor_id = %s",
+            "SELECT vendor_id, email, vendor_legal_name, status FROM vendor "
+            "WHERE vendor_id = %s",
             (vendor_id,),
         )
         vendor = cursor.fetchone()
 
         if not vendor:
             return jsonify({"error": "Vendor not found"}), 404
+
+        if vendor["status"] == "active":
+            return jsonify({"error": "Vendor already active"}), 409
 
         if isapproved is True:
             password, password_hash = generate_unique_password(cursor)
