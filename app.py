@@ -244,10 +244,24 @@ def approve_vendor():
     data = request.get_json(silent=True) or {}
 
     vendor_id = data.get("vendor_id")
-    isapproved = data.get("isapproved")
+    status_code = data.get("status")
 
     if vendor_id is None:
         return jsonify({"error": "vendor_id is required"}), 400
+
+    # JSON numbers cannot have leading zeroes, so support both 1/2 and
+    # the string codes "01"/"02".
+    if isinstance(status_code, bool):
+        normalized_status_code = None
+    elif isinstance(status_code, int):
+        normalized_status_code = f"{status_code:02d}"
+    elif isinstance(status_code, str):
+        normalized_status_code = status_code.strip().zfill(2)
+    else:
+        normalized_status_code = None
+
+    if normalized_status_code not in {"01", "02"}:
+        return jsonify({"error": "status must be 01 or 02"}), 400
 
     conn = None
     cursor = None
@@ -257,7 +271,7 @@ def approve_vendor():
 
         cursor.execute(
             "SELECT vendor_id, email, vendor_legal_name, status FROM vendor "
-            "WHERE vendor_id = %s",
+            "WHERE vendor_id = %s FOR UPDATE",
             (vendor_id,),
         )
         vendor = cursor.fetchone()
@@ -265,16 +279,44 @@ def approve_vendor():
         if not vendor:
             return jsonify({"error": "Vendor not found"}), 404
 
-        if vendor["status"] == "active":
-            return jsonify({"error": "Vendor already active"}), 409
+        current_status = vendor["status"]
+        normalized_current_status = str(current_status).strip().lower()
 
-        if isapproved is True:
+        if normalized_status_code == "01":
+            if normalized_current_status != "pending":
+                return jsonify(
+                    {
+                        "error": "Status 01 is only valid for a pending vendor",
+                        "current_status": current_status,
+                    }
+                ), 409
+
+            cursor.execute(
+                "UPDATE vendor SET status = %s WHERE vendor_id = %s",
+                ("sent for approval", vendor_id),
+            )
+            conn.commit()
+            new_status = "sent for approval"
+            message = "Vendor sent for approval"
+        else:
+            if normalized_current_status != "sent for approval":
+                return jsonify(
+                    {
+                        "error": (
+                            "Status 02 is only valid for a vendor that has been "
+                            "sent for approval"
+                        ),
+                        "current_status": current_status,
+                    }
+                ), 409
+
             password, password_hash = generate_unique_password(cursor)
             cursor.execute(
                 "UPDATE vendor SET status = %s, password = %s WHERE vendor_id = %s",
                 ("active", password_hash, vendor_id),
             )
             conn.commit()
+            new_status = "active"
             message = "Vendor approved successfully"
 
             email_sent = True
@@ -297,16 +339,13 @@ def approve_vendor():
                 ).raise_for_status()
             except requests.RequestException:
                 email_sent = False
-        else:
-            message = "Vendor remains pending"
-
         response = {
             "message": message,
             "vendor_id": vendor_id,
             "email": vendor["email"],
-            "isapproved": isapproved,
+            "status": new_status,
         }
-        if isapproved is True:
+        if normalized_status_code == "02":
             response["password"] = password
             response["email_sent"] = email_sent
 
