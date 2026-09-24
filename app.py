@@ -1,9 +1,11 @@
 import hashlib
 import hmac
 import json
+import re
 import secrets
-from datetime import date, datetime
-from decimal import Decimal
+import uuid
+from datetime import date, datetime, timezone
+from decimal import Decimal, InvalidOperation
 
 import requests
 from flask import Flask, jsonify, request
@@ -16,6 +18,7 @@ app = Flask(__name__)
 CORS(app, origins=["http://localhost:5173", "http://127.0.0.1:5173"])
 
 EMAIL_API_URL = "http://127.0.0.1:8000/api/email/send"
+INVOICE_OCR_API_URL = "http://127.0.0.1:8000/api/invoice/ocr"
 
 VENDOR_FIELDS = [
     "title",
@@ -104,6 +107,66 @@ def _serialize_row(row, json_fields=()):
         else:
             serialized[key] = value
     return serialized
+
+
+def _decimal_value(value):
+    """Convert OCR currency, percentage, and number strings to Decimal."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float, Decimal)):
+        return Decimal(str(value))
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    negative = text.startswith("(") and text.endswith(")")
+    normalized = re.sub(r"[^0-9.\-]", "", text.replace(",", ""))
+    if not normalized or normalized in {"-", ".", "-."}:
+        return None
+    try:
+        result = Decimal(normalized)
+        return -result if negative and result > 0 else result
+    except InvalidOperation:
+        return None
+
+
+def _date_value(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value).strip()[:10])
+    except ValueError:
+        return None
+
+
+def _datetime_value(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _json_value(value):
+    return json.dumps(value, default=str, ensure_ascii=False)
+
+
+def _normalized_invoice_number(value):
+    if not value:
+        return None
+    return re.sub(r"[^A-Z0-9]", "", str(value).upper()) or None
 
 
 def generate_unique_password(cursor):
@@ -476,6 +539,268 @@ def check_vendor_pan():
             cursor.close()
         if conn is not None:
             conn.close()
+
+
+@app.post("/invoices/ocr")
+def upload_invoice_for_ocr():
+    vendor_id = request.form.get("vendor_id", "").strip()
+    invoice_file = request.files.get("invoices")
+
+    if not vendor_id:
+        return jsonify({"error": "vendor_id is required"}), 400
+    if invoice_file is None or not invoice_file.filename:
+        return jsonify({"error": "invoices file is required"}), 400
+
+    # Reject an invalid vendor before uploading the file to the OCR service.
+    validation_conn = None
+    validation_cursor = None
+    try:
+        validation_conn = get_connection()
+        validation_cursor = validation_conn.cursor(dictionary=True)
+        validation_cursor.execute(
+            "SELECT vendor_id FROM vendor WHERE vendor_id = %s LIMIT 1",
+            (vendor_id,),
+        )
+        if validation_cursor.fetchone() is None:
+            return jsonify({"error": "Vendor not found"}), 404
+    except MySQLError as err:
+        return jsonify({"error": str(err)}), 500
+    finally:
+        if validation_cursor is not None:
+            validation_cursor.close()
+        if validation_conn is not None:
+            validation_conn.close()
+
+    file_bytes = invoice_file.read()
+    if not file_bytes:
+        return jsonify({"error": "invoices file must not be empty"}), 400
+
+    file_id = f"invoice-{uuid.uuid4().hex}"
+    file_sha256 = hashlib.sha256(file_bytes).hexdigest()
+
+    try:
+        ocr_response = requests.post(
+            INVOICE_OCR_API_URL,
+            files={
+                "invoices": (
+                    invoice_file.filename,
+                    file_bytes,
+                    invoice_file.mimetype or "application/octet-stream",
+                )
+            },
+            data={"file_ids": file_id},
+            timeout=180,
+        )
+        ocr_response.raise_for_status()
+        ocr_data = ocr_response.json()
+    except requests.RequestException as err:
+        details = None
+        if getattr(err, "response", None) is not None:
+            try:
+                details = err.response.json()
+            except ValueError:
+                details = err.response.text[:1000]
+        return jsonify(
+            {"error": "Invoice OCR request failed", "details": details}
+        ), 502
+    except ValueError:
+        return jsonify({"error": "Invoice OCR service returned invalid JSON"}), 502
+
+    if not isinstance(ocr_data, dict):
+        return jsonify({"error": "Invoice OCR service returned an invalid response"}), 502
+
+    results = ocr_data.get("results") or []
+    result = results[0] if results and isinstance(results[0], dict) else {}
+    parsed_invoices = ocr_data.get("invoices") or []
+    invoice_data = result.get("invoice") or (
+        parsed_invoices[0]
+        if parsed_invoices and isinstance(parsed_invoices[0], dict)
+        else {}
+    )
+    saved_files = ocr_data.get("saved_files") or []
+    file_data = result.get("file") or (
+        saved_files[0]
+        if saved_files and isinstance(saved_files[0], dict)
+        else {}
+    )
+    duplicate_data = (
+        result.get("duplicate_check")
+        or invoice_data.get("duplicate_check")
+        or {}
+    )
+    vendor_gstin = (
+        result.get("gstin_verify") or invoice_data.get("gstin_verify") or {}
+    )
+    customer_gstin = (
+        result.get("customer_gstin_verify")
+        or invoice_data.get("customer_gstin_verify")
+        or {}
+    )
+    vendor_gstin_details = vendor_gstin.get("data") or {}
+    customer_gstin_details = customer_gstin.get("data") or {}
+
+    invoice_number = invoice_data.get("invoice_number") or invoice_data.get("invoice_id")
+    blob_path = file_data.get("blob_path")
+    blob_name = file_data.get("blob_name")
+    invoice_values = {
+        "vendor_id": vendor_id,
+        "file_id": file_id,
+        "original_file_name": file_data.get("original_name") or invoice_file.filename,
+        "saved_file_name": blob_name,
+        "saved_file_path": blob_path,
+        "file_size_bytes": file_data.get("size") or len(file_bytes),
+        "mime_type": file_data.get("mime_type") or invoice_file.mimetype,
+        "file_sha256": file_sha256,
+        "cached_at": _datetime_value(file_data.get("cached_at")),
+        "invoice_number": invoice_number,
+        "normalized_invoice_number": _normalized_invoice_number(invoice_number),
+        "invoice_date": _date_value(invoice_data.get("invoice_date")),
+        "due_date": _date_value(invoice_data.get("due_date")),
+        "service_start_date": _date_value(invoice_data.get("service_start_date")),
+        "service_end_date": _date_value(invoice_data.get("service_end_date")),
+        "purchase_order": invoice_data.get("purchase_order"),
+        "payment_term": invoice_data.get("payment_term"),
+        "currency": invoice_data.get("currency"),
+        "subtotal": _decimal_value(invoice_data.get("sub_total")),
+        "taxable_total": _decimal_value(invoice_data.get("taxable_total")),
+        "total_tax": _decimal_value(invoice_data.get("total_tax")),
+        "total_amount": _decimal_value(
+            invoice_data.get("total_amount") or invoice_data.get("invoice_total")
+        ),
+        "vendor_name": invoice_data.get("vendor_name"),
+        "extracted_vendor_name": invoice_data.get("extracted_vendor_name"),
+        "vendor_tax_id": invoice_data.get("vendor_tax_id"),
+        "vendor_address": invoice_data.get("vendor_address"),
+        "vendor_address_recipient": invoice_data.get("vendor_address_recipient"),
+        "customer_id": invoice_data.get("customer_id"),
+        "customer_name": invoice_data.get("customer_name"),
+        "customer_tax_id": invoice_data.get("customer_tax_id"),
+        "billing_address": invoice_data.get("billing_address"),
+        "billing_address_recipient": invoice_data.get("billing_address_recipient"),
+        "shipping_address": invoice_data.get("shipping_address"),
+        "shipping_address_recipient": invoice_data.get("shipping_address_recipient"),
+        "confidence": _decimal_value(invoice_data.get("confidence")),
+        "vendor_gstin_verified": vendor_gstin.get("valid"),
+        "vendor_gstin_status": vendor_gstin_details.get("status"),
+        "vendor_gstin_trade_name": vendor_gstin_details.get("tradeName"),
+        "vendor_gstin_legal_name": vendor_gstin_details.get("legalName"),
+        "vendor_gstin_data": _json_value(vendor_gstin) if vendor_gstin else None,
+        "customer_gstin_verified": customer_gstin.get("valid"),
+        "customer_gstin_status": customer_gstin_details.get("status"),
+        "customer_gstin_trade_name": customer_gstin_details.get("tradeName"),
+        "customer_gstin_legal_name": customer_gstin_details.get("legalName"),
+        "customer_gstin_data": _json_value(customer_gstin) if customer_gstin else None,
+        "source_channel": duplicate_data.get("source_channel"),
+        "pipeline_phase": duplicate_data.get("pipeline_phase"),
+        "pipeline_version": duplicate_data.get("pipeline_version"),
+        "duplicate_status": duplicate_data.get("duplicate_status"),
+        "duplicate_decision": duplicate_data.get("duplicate_decision"),
+        "duplicate_score": _decimal_value(duplicate_data.get("duplicate_score")),
+        "duplicate_risk_level": duplicate_data.get("duplicate_risk_level"),
+        "recommended_action": duplicate_data.get("recommended_action"),
+        "duplicate_evaluated_at": _datetime_value(duplicate_data.get("evaluated_at")),
+        "block_id": duplicate_data.get("block_id"),
+        "matched_invoice_ids": _json_value(duplicate_data.get("matched_invoice_ids", [])),
+        "duplicate_reasons": _json_value(duplicate_data.get("duplicate_reasons", [])),
+        "score_breakdown": _json_value(duplicate_data.get("score_breakdown", [])),
+        "duplicate_check_data": _json_value(duplicate_data) if duplicate_data else None,
+        "raw_response": _json_value(ocr_data),
+        "status": "pending",
+        "blob_url": blob_path,
+        "blob_name": blob_name,
+    }
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        columns = ", ".join(invoice_values)
+        placeholders = ", ".join(["%s"] * len(invoice_values))
+        cursor.execute(
+            f"INSERT INTO invoices ({columns}) VALUES ({placeholders})",
+            list(invoice_values.values()),
+        )
+        database_invoice_id = cursor.lastrowid
+
+        for tax in invoice_data.get("tax_details") or []:
+            cursor.execute(
+                "INSERT INTO invoice_tax_details "
+                "(invoice_id, tax_type, tax_description, tax_rate, tax_amount) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (
+                    database_invoice_id,
+                    tax.get("tax_type") or tax.get("tax_desc"),
+                    tax.get("tax_description") or tax.get("tax_desc"),
+                    _decimal_value(tax.get("rate")),
+                    _decimal_value(tax.get("amount")),
+                ),
+            )
+
+        normalized_items = invoice_data.get("line_items") or []
+        source_items = invoice_data.get("items") or []
+        line_items = normalized_items or source_items
+        for index, line_item in enumerate(line_items, start=1):
+            source_item = source_items[index - 1] if index <= len(source_items) else {}
+            combined_item = {**source_item, **line_item}
+            raw_tax = combined_item.get("tax")
+            tax_amount = (
+                _decimal_value(raw_tax.get("amount"))
+                if isinstance(raw_tax, dict)
+                else _decimal_value(raw_tax)
+            )
+            extracted_tax_text = (
+                _json_value(raw_tax) if isinstance(raw_tax, (dict, list)) else raw_tax
+            )
+            cursor.execute(
+                "INSERT INTO invoice_line_items "
+                "(invoice_id, line_number, product_code, description, item_date, "
+                "quantity, unit, unit_price, taxable_amount, tax_amount, "
+                "total_amount, extracted_tax_text, raw_item_data) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    database_invoice_id,
+                    index,
+                    combined_item.get("product_code"),
+                    combined_item.get("description"),
+                    _date_value(combined_item.get("date")),
+                    _decimal_value(combined_item.get("quantity")),
+                    combined_item.get("unit"),
+                    _decimal_value(combined_item.get("unit_price")),
+                    _decimal_value(
+                        combined_item.get("taxable_amount")
+                        or combined_item.get("amount")
+                    ),
+                    tax_amount,
+                    _decimal_value(
+                        combined_item.get("total_amount")
+                        or combined_item.get("amount")
+                    ),
+                    extracted_tax_text,
+                    _json_value(combined_item),
+                ),
+            )
+
+        conn.commit()
+    except (MySQLError, TypeError, ValueError) as err:
+        if conn is not None:
+            conn.rollback()
+        return jsonify({"error": f"Unable to save OCR response: {err}"}), 500
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+
+    return jsonify(
+        {
+            "message": "Invoice processed and saved successfully",
+            "invoice_id": database_invoice_id,
+            "file_id": file_id,
+            "ocr_response": ocr_data,
+        }
+    ), 201
 
 
 @app.get("/invoices")
