@@ -4,7 +4,7 @@ import json
 import re
 import secrets
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
 import requests
@@ -19,6 +19,12 @@ CORS(app, origins=["http://localhost:5173", "http://127.0.0.1:5173"])
 
 EMAIL_API_URL = "http://127.0.0.1:8000/api/email/send"
 INVOICE_OCR_API_URL = "http://127.0.0.1:8000/api/invoice/ocr"
+
+FRONTEND_BASE_URL = "http://localhost:5173/"
+SUPPORT_EMAIL = "support@fourthsignal.com"
+MAKER_EMAIL = "soham.m@fourthsignal.com"
+REVIEW_DAYS = 3
+IST = timezone(timedelta(hours=5, minutes=30))
 
 VENDOR_FIELDS = [
     "title",
@@ -185,6 +191,84 @@ def generate_unique_password(cursor):
     raise RuntimeError("Unable to generate a unique vendor password")
 
 
+def _send_email(to, subject, template_name, params):
+    """Call the shared email service. Never raises: a failed email must not fail the request."""
+    try:
+        requests.post(
+            EMAIL_API_URL,
+            json={
+                "to": to,
+                "subject": subject,
+                "template_name": template_name,
+                "params": params,
+            },
+            timeout=10,
+        ).raise_for_status()
+        return True
+    except requests.RequestException as err:
+        app.logger.warning("Email '%s' to %s failed: %s", template_name, to, err)
+        return False
+
+
+def _now_ist_text():
+    return datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
+
+
+def _send_registration_emails(vendor_id, vendor_name, vendor_email):
+    request_id = f"VR-{vendor_id}"
+    _send_email(
+        vendor_email,
+        "We've received your registration request",
+        "vendor_registration_received",
+        {
+            "vendor_name": vendor_name,
+            "review_days": REVIEW_DAYS,
+            "request_id": request_id,
+            "support_email": SUPPORT_EMAIL,
+        },
+    )
+    _send_email(
+        MAKER_EMAIL,
+        f"New vendor registration awaiting review - {vendor_name}",
+        "vendor_registration_submitted",
+        {
+            "vendor_name": vendor_name,
+            "submitted_by": f"{vendor_name} ({vendor_email})",
+            "submitted_at": _now_ist_text(),
+            "request_id": request_id,
+            "review_url": FRONTEND_BASE_URL,
+        },
+    )
+
+
+def _send_invoice_emails(vendor_name, vendor_email, invoice_number, total_amount, currency):
+    amount_text = f"{currency or 'INR'} {total_amount:,.2f}" if total_amount is not None else "N/A"
+    _send_email(
+        vendor_email,
+        f"Invoice received - {invoice_number}",
+        "invoice_received",
+        {
+            "vendor_name": vendor_name,
+            "invoice_number": invoice_number,
+            "invoice_amount": amount_text,
+            "review_days": REVIEW_DAYS,
+            "support_email": SUPPORT_EMAIL,
+        },
+    )
+    _send_email(
+        MAKER_EMAIL,
+        f"New invoice needs review - {invoice_number}",
+        "invoice_submitted",
+        {
+            "vendor_name": vendor_name,
+            "invoice_number": invoice_number,
+            "invoice_amount": amount_text,
+            "submitted_at": _now_ist_text(),
+            "review_url": FRONTEND_BASE_URL,
+        },
+    )
+
+
 @app.get("/vendors")
 def get_vendors():
     vendor_id = request.args.get("vendor") or request.args.get("vendor_id")
@@ -253,6 +337,13 @@ def create_vendor():
         conn.close()
     except MySQLError as err:
         return jsonify({"error": str(err)}), 500
+
+    if row.get("email"):
+        _send_registration_emails(
+            new_vendor_id,
+            row.get("vendor_legal_name") or row.get("name"),
+            row["email"],
+        )
 
     return jsonify(row), 201
 
@@ -558,10 +649,12 @@ def upload_invoice_for_ocr():
         validation_conn = get_connection()
         validation_cursor = validation_conn.cursor(dictionary=True)
         validation_cursor.execute(
-            "SELECT vendor_id FROM vendor WHERE vendor_id = %s LIMIT 1",
+            "SELECT vendor_id, email, vendor_legal_name FROM vendor "
+            "WHERE vendor_id = %s LIMIT 1",
             (vendor_id,),
         )
-        if validation_cursor.fetchone() is None:
+        vendor_row = validation_cursor.fetchone()
+        if vendor_row is None:
             return jsonify({"error": "Vendor not found"}), 404
     except MySQLError as err:
         return jsonify({"error": str(err)}), 500
@@ -792,6 +885,15 @@ def upload_invoice_for_ocr():
             cursor.close()
         if conn is not None:
             conn.close()
+
+    if vendor_row.get("email"):
+        _send_invoice_emails(
+            vendor_row.get("vendor_legal_name"),
+            vendor_row["email"],
+            invoice_number or invoice_file.filename,
+            invoice_values["total_amount"],
+            invoice_values["currency"],
+        )
 
     return jsonify(
         {
