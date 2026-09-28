@@ -33,8 +33,6 @@ VENDOR_FIELDS = [
     "contact_no",
     "vendor_legal_name",
     "vendor_type",
-    "vendor_category",
-    "vendor_subcategory",
     "year_established",
     "currency",
     "registration_number",
@@ -80,8 +78,6 @@ LINE_ITEM_JSON_FIELDS = {"raw_item_data"}
 REQUIRED_FIELDS = [
     "vendor_legal_name",
     "vendor_type",
-    "vendor_category",
-    "vendor_subcategory",
     "registration_number",
     "pan",
     "street",
