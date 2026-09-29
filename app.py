@@ -24,6 +24,7 @@ FRONTEND_BASE_URL = "http://localhost:5173/"
 SUPPORT_EMAIL = "support@fourthsignal.com"
 MAKER_EMAIL = "soham.m@fourthsignal.com"
 REVIEW_DAYS = 3
+MAKER_VENDOR_ID = "maker"
 IST = timezone(timedelta(hours=5, minutes=30))
 
 VENDOR_FIELDS = [
@@ -914,9 +915,26 @@ def get_invoices():
         cursor = conn.cursor(dictionary=True)
 
         cursor.execute(
-            "SELECT * FROM invoices WHERE vendor_id = %s ORDER BY id",
+            "SELECT gstin FROM vendor WHERE vendor_id = %s LIMIT 1",
             (vendor_id,),
         )
+        vendor_row = cursor.fetchone()
+        vendor_gstin = ((vendor_row or {}).get("gstin") or "").strip().upper()
+
+        # Invoices uploaded by the vendor itself, plus invoices a maker uploaded
+        # on the vendor's behalf (stored with vendor_id = 'maker', matched by GSTIN).
+        if vendor_gstin:
+            cursor.execute(
+                "SELECT * FROM invoices WHERE vendor_id = %s "
+                "OR (vendor_id = %s AND UPPER(TRIM(vendor_tax_id)) = %s) "
+                "ORDER BY id",
+                (vendor_id, MAKER_VENDOR_ID, vendor_gstin),
+            )
+        else:
+            cursor.execute(
+                "SELECT * FROM invoices WHERE vendor_id = %s ORDER BY id",
+                (vendor_id,),
+            )
         invoices = cursor.fetchall()
 
         if not invoices:
@@ -950,6 +968,9 @@ def get_invoices():
         result = []
         for invoice in invoices:
             serialized_invoice = _serialize_row(invoice, INVOICE_JSON_FIELDS)
+            serialized_invoice["uploaded_by_type"] = (
+                "maker" if invoice["vendor_id"] == MAKER_VENDOR_ID else "vendor"
+            )
             serialized_invoice["tax_details"] = tax_details_by_invoice.get(invoice["id"], [])
             serialized_invoice["line_items"] = line_items_by_invoice.get(invoice["id"], [])
             result.append(serialized_invoice)
