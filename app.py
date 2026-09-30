@@ -78,6 +78,10 @@ LINE_ITEM_JSON_FIELDS = {"raw_item_data"}
 
 REQUIRED_FIELDS = [
     "vendor_legal_name",
+    "email",
+    "contact_no",
+    "currency",
+    "msme_status",
     "vendor_type",
     "registration_number",
     "pan",
@@ -92,6 +96,46 @@ REQUIRED_FIELDS = [
     "bank_account_no",
     "ifsc_code",
 ]
+
+
+MSME_STATUSES = {"Registered", "Not registered", "Not applicable"}
+VENDOR_TYPES = {
+    "Individual",
+    "Proprietorship",
+    "Partnership",
+    "Private limited company",
+    "Public limited company",
+    "Government entity",
+    "Other",
+}
+
+
+def _clean_tax_id(value):
+    """Strip stray leading punctuation OCR sometimes captures (e.g. ':29AAD...')."""
+    if not isinstance(value, str):
+        return value
+    return value.strip().lstrip(":;.- 	").strip() or None
+
+
+def _validate_vendor_values(values, existing=None):
+    """Return an error message for invalid vendor data, or None.
+
+    `values` holds the fields being written; `existing` is the stored row (PATCH)
+    so cross-field rules can see the final state.
+    """
+    for field in REQUIRED_FIELDS:
+        if field in values and not str(values[field] or "").strip():
+            return f"{field} cannot be empty"
+
+    if values.get("msme_status") and values["msme_status"] not in MSME_STATUSES:
+        return "msme_status must be one of: " + ", ".join(sorted(MSME_STATUSES))
+    if values.get("vendor_type") and values["vendor_type"] not in VENDOR_TYPES:
+        return "vendor_type is not a recognised value"
+
+    final = {**(existing or {}), **values}
+    if final.get("msme_status") == "Registered" and not str(final.get("udyam_number") or "").strip():
+        return "udyam_number is required when msme_status is Registered"
+    return None
 
 
 def _serialize_row(row, json_fields=()):
@@ -316,6 +360,11 @@ def create_vendor():
     # (e.g. currency, msme_status, status) fall back to their DB defaults
     # instead of being explicitly inserted as NULL.
     values = {field: data[field] for field in VENDOR_FIELDS if data.get(field) is not None}
+    if values.get("msme_status") != "Registered":
+        values.pop("udyam_number", None)
+    validation_error = _validate_vendor_values(values)
+    if validation_error:
+        return jsonify({"error": validation_error}), 400
 
     columns = ", ".join(values.keys())
     placeholders = ", ".join(["%s"] * len(values))
@@ -364,9 +413,16 @@ def update_vendor():
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
 
-        cursor.execute("SELECT vendor_id FROM vendor WHERE vendor_id = %s", (vendor_id,))
-        if cursor.fetchone() is None:
+        cursor.execute("SELECT * FROM vendor WHERE vendor_id = %s", (vendor_id,))
+        existing = cursor.fetchone()
+        if existing is None:
             return jsonify({"error": "Vendor not found"}), 404
+
+        if "msme_status" in values and values["msme_status"] != "Registered":
+            values["udyam_number"] = None
+        validation_error = _validate_vendor_values(values, existing)
+        if validation_error:
+            return jsonify({"error": validation_error}), 400
 
         assignments = ", ".join(f"{field} = %s" for field in values)
         cursor.execute(
@@ -759,12 +815,12 @@ def upload_invoice_for_ocr():
         ),
         "vendor_name": invoice_data.get("vendor_name"),
         "extracted_vendor_name": invoice_data.get("extracted_vendor_name"),
-        "vendor_tax_id": invoice_data.get("vendor_tax_id"),
+        "vendor_tax_id": _clean_tax_id(invoice_data.get("vendor_tax_id")),
         "vendor_address": invoice_data.get("vendor_address"),
         "vendor_address_recipient": invoice_data.get("vendor_address_recipient"),
         "customer_id": invoice_data.get("customer_id"),
         "customer_name": invoice_data.get("customer_name"),
-        "customer_tax_id": invoice_data.get("customer_tax_id"),
+        "customer_tax_id": _clean_tax_id(invoice_data.get("customer_tax_id")),
         "billing_address": invoice_data.get("billing_address"),
         "billing_address_recipient": invoice_data.get("billing_address_recipient"),
         "shipping_address": invoice_data.get("shipping_address"),
