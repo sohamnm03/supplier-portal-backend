@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import os
 import re
 import secrets
 import uuid
@@ -17,8 +18,10 @@ from db import get_connection
 app = Flask(__name__)
 CORS(app, origins=["http://localhost:5173", "http://127.0.0.1:5173"])
 
-EMAIL_API_URL = "http://127.0.0.1:8000/api/email/send"
-INVOICE_OCR_API_URL = "http://127.0.0.1:8000/api/invoice/ocr"
+# Deployed shared-services API (email + invoice OCR). Override with SHARED_SERVICES_URL in .env if needed.
+SHARED_SERVICES_URL = os.getenv("SHARED_SERVICES_URL", "https://fs-quad-shared.azurewebsites.net").rstrip("/")
+EMAIL_API_URL = f"{SHARED_SERVICES_URL}/api/email/send"
+INVOICE_OCR_API_URL = f"{SHARED_SERVICES_URL}/api/invoice/ocr"
 
 FRONTEND_BASE_URL = "http://localhost:5173/"
 SUPPORT_EMAIL = "support@fourthsignal.com"
