@@ -14,9 +14,11 @@ from flask_cors import CORS
 from mysql.connector import Error as MySQLError
 
 from db import get_connection
+import update_requests
 
 app = Flask(__name__)
-CORS(app, origins=["http://localhost:5173", "http://127.0.0.1:5173"])
+# Any local dev port: Vite moves to the next free port (5174, ...) when 5173 is already taken.
+CORS(app, origins=[r"http://(localhost|127\.0\.0\.1):\d+"])
 
 # Deployed shared-services API (email + invoice OCR). Override with SHARED_SERVICES_URL in .env if needed.
 SHARED_SERVICES_URL = os.getenv("SHARED_SERVICES_URL", "https://fs-quad-shared.azurewebsites.net").rstrip("/")
@@ -396,50 +398,40 @@ def create_vendor():
 
     return jsonify(row), 201
 
+# Profile fields a vendor may ask to change. Email is the login name, so it is not editable here.
+PROFILE_FIELDS = [
+    "vendor_legal_name", "contact_no", "vendor_type", "year_established", "currency",
+    "registration_number", "msme_status", "udyam_number", "gstin", "pan", "aadhaar_no", "cin",
+    "street", "city", "district", "region", "postal_code",
+    "account_holder_name", "bank_name", "branch_name", "bank_account_no", "ifsc_code",
+]
+
+
+def _norm(value):
+    return "" if value is None else str(value).strip()
+
+
 @app.patch("/vendors")
 def update_vendor():
-    data = request.get_json(silent=True)
-    if not data:
-        return jsonify({"error": "Request body must be JSON"}), 400
+    # Profile changes must go through the review flow (POST /vendors/update-requests).
+    return jsonify({"error": "Vendor details can no longer be changed directly. Submit an update request instead."}), 403
 
+
+@app.post("/vendors/update-requests")
+def create_update_request():
+    data = request.get_json(silent=True) or {}
     vendor_id = data.get("vendor_id")
-    if vendor_id is None:
-        return jsonify({"error": "vendor_id is required"}), 400
+    details = data.get("details")
+    if vendor_id is None or not isinstance(details, dict):
+        return jsonify({"error": "vendor_id and details are required"}), 400
 
-    values = {field: data[field] for field in VENDOR_FIELDS if field in data}
-    if not values:
-        return jsonify({"error": "No updatable fields provided"}), 400
-
-    conn = None
-    cursor = None
+    conn = cursor = None
     try:
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
-
         cursor.execute("SELECT * FROM vendor WHERE vendor_id = %s", (vendor_id,))
-        existing = cursor.fetchone()
-        if existing is None:
-            return jsonify({"error": "Vendor not found"}), 404
-
-        if "msme_status" in values and values["msme_status"] != "Registered":
-            values["udyam_number"] = None
-        validation_error = _validate_vendor_values(values, existing)
-        if validation_error:
-            return jsonify({"error": validation_error}), 400
-
-        assignments = ", ".join(f"{field} = %s" for field in values)
-        cursor.execute(
-            f"UPDATE vendor SET {assignments} WHERE vendor_id = %s",
-            [*values.values(), vendor_id],
-        )
-        conn.commit()
-
-        columns = ", ".join(VENDOR_RESPONSE_FIELDS)
-        cursor.execute(f"SELECT {columns} FROM vendor WHERE vendor_id = %s", (vendor_id,))
-        row = cursor.fetchone()
+        vendor = cursor.fetchone()
     except MySQLError as err:
-        if conn is not None:
-            conn.rollback()
         return jsonify({"error": str(err)}), 500
     finally:
         if cursor is not None:
@@ -447,7 +439,62 @@ def update_vendor():
         if conn is not None:
             conn.close()
 
-    return jsonify(row), 200
+    if vendor is None:
+        return jsonify({"error": "Vendor not found"}), 404
+    if _norm(vendor.get("status")).lower() != "active":
+        return jsonify({"error": "Only active vendors can request profile updates"}), 409
+
+    if update_requests.get_open_request(vendor_id):
+        return jsonify({"error": "You already have an update request awaiting review."}), 409
+
+    requested = {field: details[field] for field in PROFILE_FIELDS if field in details}
+    if requested.get("msme_status") != "Registered" and "msme_status" in requested:
+        requested["udyam_number"] = None
+    validation_error = _validate_vendor_values(requested, vendor)
+    if validation_error:
+        return jsonify({"error": validation_error}), 400
+
+    changed = [f for f in requested if _norm(requested[f]) != _norm(vendor.get(f))]
+    if not changed:
+        return jsonify({"error": "No changes to submit."}), 400
+
+    old_values = {f: vendor.get(f) for f in changed}
+    new_values = {f: requested[f] for f in changed}
+    row = update_requests.create_request(vendor_id, old_values, new_values, changed, vendor.get("email"))
+
+    # Same acknowledgement + "awaiting review" emails a new registration triggers, reused until
+    # dedicated update-request templates exist. _send_email never raises.
+    if vendor.get("email"):
+        vendor_name = vendor.get("vendor_legal_name") or vendor.get("name")
+        request_ref = f"UR-{row['request_id']}"
+        _send_email(
+            vendor["email"],
+            "We've received your update request",
+            "vendor_registration_received",
+            {"vendor_name": vendor_name, "review_days": REVIEW_DAYS, "request_id": request_ref, "support_email": SUPPORT_EMAIL},
+        )
+        _send_email(
+            MAKER_EMAIL,
+            f"Vendor update request awaiting review - {vendor_name}",
+            "vendor_registration_submitted",
+            {
+                "vendor_name": vendor_name,
+                "submitted_by": f"{vendor_name} ({vendor['email']})",
+                "submitted_at": _now_ist_text(),
+                "request_id": request_ref,
+                "review_url": FRONTEND_BASE_URL,
+            },
+        )
+    return jsonify(row), 201
+
+
+@app.get("/vendors/update-requests")
+def list_update_requests():
+    vendor_id = request.args.get("vendor_id")
+    if not vendor_id:
+        return jsonify({"error": "vendor_id is required"}), 400
+    return jsonify(update_requests.list_requests(int(vendor_id))), 200
+
 
 @app.post("/vendors/approval")
 def approve_vendor():
