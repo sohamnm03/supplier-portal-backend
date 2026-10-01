@@ -122,6 +122,32 @@ def _clean_tax_id(value):
     return value.strip().lstrip(":;.- 	").strip() or None
 
 
+def _find_duplicate_identity(values):
+    """Return a message if the PAN or email in `values` already belongs to a vendor."""
+    checks = [
+        ("pan", "PAN", lambda v: str(v).strip().upper(), "UPPER(TRIM(pan))"),
+        ("email", "email", lambda v: str(v).strip().lower(), "LOWER(TRIM(email))"),
+    ]
+    conn = cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        for field, label, normalise, column_sql in checks:
+            if not values.get(field) or not str(values[field]).strip():
+                continue
+            cursor.execute(f"SELECT vendor_id FROM vendor WHERE {column_sql} = %s LIMIT 1", (normalise(values[field]),))
+            if cursor.fetchone():
+                return f"A vendor with this {label} already exists."
+    except MySQLError:
+        return None  # the INSERT below will surface a real database problem
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+    return None
+
+
 def _validate_vendor_values(values, existing=None):
     """Return an error message for invalid vendor data, or None.
 
@@ -213,6 +239,11 @@ def _datetime_value(value):
 
 def _json_value(value):
     return json.dumps(value, default=str, ensure_ascii=False)
+
+
+def _generate_invoice_reference(invoice_id):
+    """Reference that traces an invoice from upload to its SAP posting, e.g. INV-20261001-000123."""
+    return f"INV-{datetime.now(IST).strftime('%Y%m%d')}-{int(invoice_id):06d}"
 
 
 def _normalized_invoice_number(value):
@@ -371,6 +402,12 @@ def create_vendor():
     if validation_error:
         return jsonify({"error": validation_error}), 400
 
+    # The form checks these as you type, but a vendor must never be created with a PAN /
+    # email that already belongs to another vendor, whatever the client sent.
+    duplicate_error = _find_duplicate_identity(values)
+    if duplicate_error:
+        return jsonify({"error": duplicate_error}), 409
+
     columns = ", ".join(values.keys())
     placeholders = ", ".join(["%s"] * len(values))
     sql = f"INSERT INTO vendor ({columns}) VALUES ({placeholders})"
@@ -405,6 +442,11 @@ PROFILE_FIELDS = [
     "street", "city", "district", "region", "postal_code",
     "account_holder_name", "bank_name", "branch_name", "bank_account_no", "ifsc_code",
 ]
+
+
+# Details that come from the GSTIN / PAN registration and are therefore fixed once set: the portal greys
+# them out, and the server refuses a request that tries to change them anyway.
+LOCKED_PROFILE_FIELDS = ["gstin", "pan", "vendor_legal_name", "street", "region", "postal_code"]
 
 
 def _norm(value):
@@ -454,7 +496,13 @@ def create_update_request():
     if validation_error:
         return jsonify({"error": validation_error}), 400
 
+    if not _norm(requested.get("gstin", vendor.get("gstin"))):
+        return jsonify({"error": "GSTIN is required"}), 400
+
     changed = [f for f in requested if _norm(requested[f]) != _norm(vendor.get(f))]
+    locked = [f for f in changed if f in LOCKED_PROFILE_FIELDS and _norm(vendor.get(f))]
+    if locked:
+        return jsonify({"error": "These details can't be changed: " + ", ".join(locked)}), 400
     if not changed:
         return jsonify({"error": "No changes to submit."}), 400
 
@@ -919,6 +967,11 @@ def upload_invoice_for_ocr():
             list(invoice_values.values()),
         )
         database_invoice_id = cursor.lastrowid
+        # System-generated reference, same format the enterprise app uses: INV-<date>-<6-digit invoice id>.
+        cursor.execute(
+            "UPDATE invoices SET inv_ref_gen = %s WHERE id = %s",
+            (_generate_invoice_reference(database_invoice_id), database_invoice_id),
+        )
 
         for tax in invoice_data.get("tax_details") or []:
             cursor.execute(
