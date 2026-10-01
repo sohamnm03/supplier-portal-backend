@@ -241,9 +241,17 @@ def _json_value(value):
     return json.dumps(value, default=str, ensure_ascii=False)
 
 
+# SAP stores this value in the document's Reference field (BKPF-XBLNR), which is only 16
+# characters wide — anything longer is silently cut off in SAP (FB03 showed every invoice as
+# "INV-20261001-000"). The reference is therefore built to always fit in 16 characters, so the
+# value shown in the app is exactly what SAP stores.
+SAP_REFERENCE_MAX_LENGTH = 16
+
+
 def _generate_invoice_reference(invoice_id):
-    """Reference that traces an invoice from upload to its SAP posting, e.g. INV-20261001-000123."""
-    return f"INV-{datetime.now(IST).strftime('%Y%m%d')}-{int(invoice_id):06d}"
+    """Reference that traces an invoice from upload to its SAP posting:
+    INV + YYMMDD + 7-digit invoice id (e.g. INV2610010000032), 16 characters."""
+    return f"INV{datetime.now(IST).strftime('%y%m%d')}{int(invoice_id):07d}"
 
 
 def _normalized_invoice_number(value):
@@ -967,7 +975,7 @@ def upload_invoice_for_ocr():
             list(invoice_values.values()),
         )
         database_invoice_id = cursor.lastrowid
-        # System-generated reference, same format the enterprise app uses: INV-<date>-<6-digit invoice id>.
+        # System-generated reference, same format the enterprise app uses: INV<YYMMDD><7-digit invoice id>.
         cursor.execute(
             "UPDATE invoices SET inv_ref_gen = %s WHERE id = %s",
             (_generate_invoice_reference(database_invoice_id), database_invoice_id),
