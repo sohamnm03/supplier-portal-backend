@@ -7,8 +7,12 @@ import secrets
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from urllib.parse import quote
 
 import requests
+from azure.core.exceptions import AzureError
+from azure.storage.blob import BlobServiceClient, ContentSettings
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from mysql.connector import Error as MySQLError
@@ -44,6 +48,7 @@ VENDOR_FIELDS = [
     "registration_number",
     "msme_status",
     "udyam_number",
+    "assigned_rm",
     "gstin",
     "pan",
     "aadhaar_no",
@@ -104,6 +109,8 @@ REQUIRED_FIELDS = [
 
 
 MSME_STATUSES = {"Registered", "Not registered", "Not applicable"}
+# Relationship managers a vendor can be assigned to (the same list as the portal's "Assigned RM" dropdown).
+ASSIGNED_RMS = {"Priya Nair", "Arjun Verma", "Kavita Rao"}
 VENDOR_TYPES = {
     "Individual",
     "Proprietorship",
@@ -162,6 +169,8 @@ def _validate_vendor_values(values, existing=None):
         return "msme_status must be one of: " + ", ".join(sorted(MSME_STATUSES))
     if values.get("vendor_type") and values["vendor_type"] not in VENDOR_TYPES:
         return "vendor_type is not a recognised value"
+    if values.get("assigned_rm") and values["assigned_rm"] not in ASSIGNED_RMS:
+        return "assigned_rm is not a recognised value"
 
     final = {**(existing or {}), **values}
     if final.get("msme_status") == "Registered" and not str(final.get("udyam_number") or "").strip():
@@ -442,6 +451,140 @@ def create_vendor():
         )
 
     return jsonify(row), 201
+
+
+# Supporting documents uploaded with an onboarding request, kept in the Azure Blob container named by
+# AZURE_DOCS_BLOB_CONTAINER (no database table needed):
+#   vendor_<id>/<type>_<random>.<ext>, with the original file name, type and upload time as blob metadata.
+# Each type maps to how many files it accepts. Keep this in step with the portal's "Upload supporting documents".
+DOCUMENT_TYPES = {
+    "pan": ("PAN card", 1),
+    "aadhaar": ("Aadhaar card", 1),
+    "gstin": ("GST registration certificate", 1),
+    "bank": ("Bank account proof", 1),
+    "cin": ("CIN / certificate of incorporation", 1),
+    "other": ("Other supporting document", 3),
+}
+DOCUMENT_MAX_BYTES = 5 * 1024 * 1024
+DOCUMENT_MAX_PER_VENDOR = 16
+# A file must actually start the way its extension says, so a renamed .exe is not accepted as a PDF.
+DOCUMENT_SIGNATURES = {
+    ".pdf": b"%PDF",
+    ".png": b"\x89PNG\r\n\x1a\n",
+    ".jpg": b"\xff\xd8\xff",
+    ".jpeg": b"\xff\xd8\xff",
+}
+DOCUMENT_CONTENT_TYPES = {
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+}
+
+
+def _docs_container():
+    """The supporting-documents blob container, or None when Azure storage is not configured."""
+    connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+    container_name = os.getenv("AZURE_DOCS_BLOB_CONTAINER")
+    if not connection_string or not container_name:
+        return None
+    return BlobServiceClient.from_connection_string(connection_string).get_container_client(container_name)
+
+
+@app.post("/vendors/<int:vendor_id>/documents")
+def upload_vendor_documents(vendor_id):
+    conn = cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT vendor_id, status FROM vendor WHERE vendor_id = %s", (vendor_id,))
+        vendor = cursor.fetchone()
+    except MySQLError as err:
+        return jsonify({"error": str(err)}), 500
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+
+    if vendor is None:
+        return jsonify({"error": "Vendor not found"}), 404
+    # Onboarding documents are for a request still in review; an approved vendor's record is not added to this way.
+    if _norm(vendor.get("status")).lower() == "active":
+        return jsonify({"error": "Documents can only be added to a request that is still awaiting approval."}), 409
+
+    unknown = [key for key in request.files if key not in DOCUMENT_TYPES]
+    if unknown:
+        return jsonify({"error": "Unknown document type: " + ", ".join(unknown)}), 400
+
+    # Check every file before saving any, so a bad one never leaves a half-uploaded set behind.
+    staged = []
+    for doc_type, (label, max_files) in DOCUMENT_TYPES.items():
+        files = [item for item in request.files.getlist(doc_type) if item and item.filename]
+        if len(files) > max_files:
+            return jsonify({"error": f"{label}: attach at most {max_files} file(s)."}), 400
+        for item in files:
+            extension = Path(item.filename).suffix.lower()
+            if extension not in DOCUMENT_SIGNATURES:
+                return jsonify({"error": f"{label}: only PDF, JPG or PNG files are accepted."}), 400
+            content = item.stream.read(DOCUMENT_MAX_BYTES + 1)
+            if len(content) > DOCUMENT_MAX_BYTES:
+                return jsonify({"error": f"{label}: each file must be 5 MB or smaller."}), 400
+            if not content.startswith(DOCUMENT_SIGNATURES[extension]):
+                return jsonify({"error": f"{label}: {item.filename} is not a valid {extension[1:].upper()} file."}), 400
+            staged.append((doc_type, item.filename, extension, content))
+
+    if not staged:
+        return jsonify({"error": "No documents were attached."}), 400
+
+    container = _docs_container()
+    if container is None:
+        return jsonify({"error": "Document storage is not configured."}), 503
+
+    prefix = f"vendor_{vendor_id}/"
+    uploaded_blobs = []
+    saved = []
+    try:
+        existing = sum(1 for _ in container.list_blobs(name_starts_with=prefix))
+        if existing + len(staged) > DOCUMENT_MAX_PER_VENDOR:
+            return jsonify({"error": "This request already has the maximum number of documents."}), 400
+
+        for doc_type, original_name, extension, content in staged:
+            blob_name = f"{prefix}{doc_type}_{uuid.uuid4().hex[:12]}{extension}"
+            uploaded_at = _now_ist_text()
+            container.upload_blob(
+                name=blob_name,
+                data=content,
+                overwrite=False,
+                content_settings=ContentSettings(content_type=DOCUMENT_CONTENT_TYPES[extension]),
+                # Blob metadata must be ASCII, so the original file name is percent-encoded.
+                metadata={
+                    "vendor_id": str(vendor_id),
+                    "doc_type": doc_type,
+                    "original_name": quote(original_name[:255], safe=""),
+                    "uploaded_at": uploaded_at,
+                },
+            )
+            uploaded_blobs.append(blob_name)
+            saved.append({
+                "type": doc_type,
+                "original_name": original_name[:255],
+                "blob_name": blob_name,
+                "size": len(content),
+                "uploaded_at": uploaded_at,
+            })
+    except AzureError:
+        app.logger.exception("Uploading supporting documents for vendor %s failed", vendor_id)
+        # Do not leave half a set behind: remove whatever this request already stored.
+        for blob_name in uploaded_blobs:
+            try:
+                container.delete_blob(blob_name)
+            except AzureError:
+                app.logger.exception("Could not remove %s after a failed upload", blob_name)
+        return jsonify({"error": "Unable to save the documents. Please try again."}), 502
+
+    return jsonify({"documents": saved}), 201
+
 
 # Profile fields a vendor may ask to change. Email is the login name, so it is not editable here.
 PROFILE_FIELDS = [
