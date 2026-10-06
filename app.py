@@ -28,6 +28,7 @@ CORS(app, origins=[r"http://(localhost|127\.0\.0\.1):\d+"])
 SHARED_SERVICES_URL = os.getenv("SHARED_SERVICES_URL", "https://fs-quad-shared.azurewebsites.net").rstrip("/")
 EMAIL_API_URL = f"{SHARED_SERVICES_URL}/api/email/send"
 INVOICE_OCR_API_URL = f"{SHARED_SERVICES_URL}/api/invoice/ocr"
+EMAIL_VERIFICATION_API_URL = f"{SHARED_SERVICES_URL}/api/email-verification"
 
 FRONTEND_BASE_URL = "http://localhost:5173/"
 SUPPORT_EMAIL = "support@fourthsignal.com"
@@ -304,6 +305,74 @@ def _send_email(to, subject, template_name, params):
         return False
 
 
+def _email_verification_headers():
+    # Kept in one place: when the shared service switches authentication on, this becomes the API key header.
+    return {"X-App-Id": "vss"}
+
+
+def _email_verification_request(method, path, **kwargs):
+    """Call the shared email-verification service. Returns the response, or None if it could not be reached."""
+    try:
+        return requests.request(
+            method,
+            f"{EMAIL_VERIFICATION_API_URL}{path}",
+            headers=_email_verification_headers(),
+            timeout=15,
+            **kwargs,
+        )
+    except requests.RequestException as err:
+        # Never log the request body: it carries the one-time code.
+        app.logger.warning("Email verification request (%s) failed: %s", method, err)
+        return None
+
+
+def _email_verification_unavailable():
+    return jsonify({"success": False, "message": "Email verification is unavailable right now. Please try again shortly."}), 503
+
+
+def _relay_email_verification(upstream):
+    """Pass the shared service's answer (body, status code, Retry-After) straight back to the browser."""
+    if upstream is None:
+        return _email_verification_unavailable()
+    try:
+        body = upstream.json()
+    except ValueError:
+        return jsonify({"success": False, "message": "Email verification returned an unexpected response."}), 502
+    response = jsonify(body)
+    response.status_code = upstream.status_code
+    if upstream.headers.get("Retry-After"):
+        response.headers["Retry-After"] = upstream.headers["Retry-After"]
+    return response
+
+
+def _verified_email_error(verification_id, email):
+    """Return (message, status) unless `verification_id` is a verified verification of `email`.
+
+    The shared service's status endpoint is the source of truth, so this is checked on the server whatever
+    the browser claims.
+    """
+    if not isinstance(verification_id, str) or not verification_id.strip():
+        return "Verify your email address before submitting.", 403
+
+    upstream = _email_verification_request("GET", f"/{quote(verification_id.strip(), safe='')}/status")
+    if upstream is None:
+        return "Email verification is unavailable right now. Please try again shortly.", 503
+    if upstream.status_code in (400, 404):
+        return "Verify your email address before submitting.", 403
+    if not upstream.ok:
+        return "Email verification could not be confirmed. Please try again.", 502
+
+    try:
+        body = upstream.json()
+    except ValueError:
+        return "Email verification could not be confirmed. Please try again.", 502
+
+    verified_email = str(body.get("email") or "").strip().lower()
+    if body.get("status") != "verified" or verified_email != str(email or "").strip().lower():
+        return "Verify your email address before submitting.", 403
+    return None
+
+
 def _now_ist_text():
     return datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
 
@@ -418,6 +487,11 @@ def create_vendor():
     validation_error = _validate_vendor_values(values)
     if validation_error:
         return jsonify({"error": validation_error}), 400
+
+    # The email must have been verified through the shared service (code or link) for this very address.
+    verification_error = _verified_email_error(data.get("verification_id"), values.get("email"))
+    if verification_error:
+        return jsonify({"error": verification_error[0]}), verification_error[1]
 
     # The form checks these as you type, but a vendor must never be created with a PAN /
     # email that already belongs to another vendor, whatever the client sent.
@@ -851,6 +925,37 @@ def check_vendor_email():
             cursor.close()
         if conn is not None:
             conn.close()
+
+
+@app.post("/vendors/email-verification/send")
+def send_email_verification():
+    data = request.get_json(silent=True) or {}
+    email = data.get("email")
+    if not isinstance(email, str) or not email.strip():
+        return jsonify({"success": False, "message": "email is required"}), 400
+
+    payload = {"email": email.strip()}
+    if isinstance(data.get("recipient_name"), str) and data["recipient_name"].strip():
+        payload["recipient_name"] = data["recipient_name"].strip()
+    return _relay_email_verification(_email_verification_request("POST", "/send", json=payload))
+
+
+@app.post("/vendors/email-verification/verify-otp")
+def verify_email_otp():
+    data = request.get_json(silent=True) or {}
+    verification_id = data.get("verification_id")
+    otp = data.get("otp")
+    if not isinstance(verification_id, str) or not verification_id.strip() or not isinstance(otp, str):
+        return jsonify({"success": False, "message": "verification_id and otp are required"}), 400
+
+    return _relay_email_verification(
+        _email_verification_request("POST", "/verify-otp", json={"verification_id": verification_id.strip(), "otp": otp.strip()})
+    )
+
+
+@app.get("/vendors/email-verification/<verification_id>/status")
+def email_verification_status(verification_id):
+    return _relay_email_verification(_email_verification_request("GET", f"/{quote(verification_id, safe='')}/status"))
 
 
 @app.post("/vendors/login")
