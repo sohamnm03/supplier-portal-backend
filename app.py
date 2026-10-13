@@ -8,17 +8,19 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import requests
 from azure.core.exceptions import AzureError
 from azure.storage.blob import BlobServiceClient, ContentSettings
-from flask import Flask, jsonify, request
+from flask import Flask, g, jsonify, request
 from flask_cors import CORS
 from mysql.connector import Error as MySQLError
 
-from db import get_connection
+import auth
+import rejections
 import update_requests
+from db import get_connection
 
 app = Flask(__name__)
 # Any local dev port: Vite moves to the next free port (5174, ...) when 5173 is already taken.
@@ -35,7 +37,13 @@ SUPPORT_EMAIL = "support@fourthsignal.com"
 MAKER_EMAIL = "soham.m@fourthsignal.com"
 REVIEW_DAYS = 3
 MAKER_VENDOR_ID = "maker"
-IST = timezone(timedelta(hours=5, minutes=30))
+# The credentials email is the same template that used to go out when a checker approved a vendor (it already
+# carries the username, password and login link).
+SIGNUP_CREDENTIALS_TEMPLATE = "vendor_account_onboarding"
+SOURCE_SELF_SERVICE = "self_service"
+STATUS_REGISTERED = "registered"
+STATUS_PENDING = "Pending"
+IST =timezone(timedelta(hours=5, minutes=30))
 
 VENDOR_FIELDS = [
     "title",
@@ -73,6 +81,10 @@ VENDOR_RESPONSE_FIELDS = [
     "created_at",
     "updated_at",
     "sap_vendor",
+    "source",
+    "submission_round",
+    "submitted_at",
+    "returned_at",
 ]
 
 INVOICE_JSON_FIELDS = {
@@ -130,8 +142,8 @@ def _clean_tax_id(value):
     return value.strip().lstrip(":;.- 	").strip() or None
 
 
-def _find_duplicate_identity(values):
-    """Return a message if the PAN or email in `values` already belongs to a vendor."""
+def _find_duplicate_identity(values, exclude_vendor_id=None):
+    """Return a message if the PAN or email in `values` already belongs to another vendor."""
     checks = [
         ("pan", "PAN", lambda v: str(v).strip().upper(), "UPPER(TRIM(pan))"),
         ("email", "email", lambda v: str(v).strip().lower(), "LOWER(TRIM(email))"),
@@ -143,7 +155,10 @@ def _find_duplicate_identity(values):
         for field, label, normalise, column_sql in checks:
             if not values.get(field) or not str(values[field]).strip():
                 continue
-            cursor.execute(f"SELECT vendor_id FROM vendor WHERE {column_sql} = %s LIMIT 1", (normalise(values[field]),))
+            cursor.execute(
+                f"SELECT vendor_id FROM vendor WHERE {column_sql} = %s AND vendor_id <> %s LIMIT 1",
+                (normalise(values[field]), exclude_vendor_id if exclude_vendor_id is not None else -1),
+            )
             if cursor.fetchone():
                 return f"A vendor with this {label} already exists."
     except MySQLError:
@@ -286,6 +301,16 @@ def generate_unique_password(cursor):
     raise RuntimeError("Unable to generate a unique vendor password")
 
 
+# No look-alike characters (0/O, 1/l/I), since the vendor types this password in from an email.
+_PASSWORD_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
+
+
+def generate_password():
+    """A random 10-character password and its SHA-256 hash (the hash format login and the maker/checker app share)."""
+    password = "".join(secrets.choice(_PASSWORD_ALPHABET) for _ in range(10))
+    return password, hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
 def _send_email(to, subject, template_name, params):
     """Call the shared email service. Never raises: a failed email must not fail the request."""
     try:
@@ -377,11 +402,11 @@ def _now_ist_text():
     return datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
 
 
-def _send_registration_emails(vendor_id, vendor_name, vendor_email):
+def _send_registration_emails(vendor_id, vendor_name, vendor_email, resubmission=False):
     request_id = f"VR-{vendor_id}"
     _send_email(
         vendor_email,
-        "We've received your registration request",
+        "We've received your updated application" if resubmission else "We've received your registration request",
         "vendor_registration_received",
         {
             "vendor_name": vendor_name,
@@ -392,7 +417,7 @@ def _send_registration_emails(vendor_id, vendor_name, vendor_email):
     )
     _send_email(
         MAKER_EMAIL,
-        f"New vendor registration awaiting review - {vendor_name}",
+        f"Vendor application resubmitted - {vendor_name}" if resubmission else f"New vendor registration awaiting review - {vendor_name}",
         "vendor_registration_submitted",
         {
             "vendor_name": vendor_name,
@@ -434,30 +459,112 @@ def _send_invoice_emails(vendor_name, vendor_email, invoice_number, total_amount
 
 @app.get("/vendors")
 def get_vendors():
-    vendor_id = request.args.get("vendor") or request.args.get("vendor_id")
+    # Vendor records are personal data and signup is now open to anyone, so vendors are no longer listed or
+    # looked up publicly. The portal reads its own record from GET /vendors/me.
+    return jsonify({"error": "Not available. Use GET /vendors/me."}), 404
 
-    conn = None
-    cursor = None
+
+# --- Self-service signup, onboarding form and progress ------------------------------------------------------
+#
+# Lifecycle (vendor.status):  registered -> Pending (maker) -> 01 (checker) -> 02 -> active
+#                                  ^                |
+#                                  +---- returned <-+   (maker or checker sends it back with reasons)
+# A vendor signs up with a verified email + phone and is emailed credentials straight away. They log in, fill
+# in the rest of the form (saved as a draft), and submit; maker and checker then review exactly as for any
+# new vendor. A return puts the vendor back in the form with the flagged fields highlighted; resubmitting
+# starts the maker -> checker review again.
+
+# Form fields a vendor fills in during onboarding. The email is the login name and is fixed at signup.
+ONBOARDING_FIELDS = [
+    "vendor_legal_name", "contact_no", "vendor_type", "year_established", "currency",
+    "registration_number", "msme_status", "udyam_number", "assigned_rm", "gstin", "pan", "aadhaar_no", "cin",
+    "street", "city", "district", "region", "postal_code",
+    "account_holder_name", "bank_name", "branch_name", "bank_account_no", "ifsc_code",
+]
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+PHONE_PATTERN = re.compile(r"^\+?[0-9][0-9 \-]{6,18}$")
+
+
+def _vendor_with_progress(vendor_id):
+    """The vendor's own record plus what the portal needs to show: lifecycle stage and any open return."""
+    conn = cursor = None
     try:
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
-        columns = ", ".join(VENDOR_RESPONSE_FIELDS)
+        cursor.execute(
+            f"SELECT {', '.join(VENDOR_RESPONSE_FIELDS)} FROM vendor WHERE vendor_id = %s LIMIT 1", (vendor_id,)
+        )
+        row = cursor.fetchone()
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+    if row is None:
+        return None
 
-        if vendor_id:
-            cursor.execute(
-                f"SELECT {columns} FROM vendor WHERE vendor_id = %s LIMIT 1",
-                (vendor_id,),
-            )
-            row = cursor.fetchone()
+    vendor = _serialize_row(row)
+    vendor["stage"] = auth.stage_for(vendor.get("status"), vendor.get("submission_round"))
+    vendor["rejection"] = rejections.get_open_rejection(vendor_id) if vendor["stage"] == auth.STAGE_RETURNED else None
+    # The rejecter's name is internal; the vendor only learns whether it was the maker's or checker's review.
+    return vendor
 
-            if not row:
-                return jsonify({"error": "Vendor not found"}), 404
 
-            return jsonify(_serialize_row(row)), 200
+@app.post("/vendors/signup")
+def signup_vendor():
+    """Create a vendor account from a verified email and a phone number, and email the login credentials."""
+    data = request.get_json(silent=True) or {}
+    email = str(data.get("email") or "").strip()
+    contact_no = str(data.get("contact_no") or "").strip()
 
-        cursor.execute(f"SELECT {columns} FROM vendor")
-        rows = [_serialize_row(row) for row in cursor.fetchall()]
+    if not EMAIL_PATTERN.match(email) or len(email) > 100:
+        return jsonify({"error": "Enter a valid email address."}), 400
+    if not PHONE_PATTERN.match(contact_no) or len(contact_no) > 20:
+        return jsonify({"error": "Enter a valid phone number."}), 400
+
+    # The email must have been verified through the shared service for this very address.
+    verification_error = _verified_email_error(data.get("verification_id"), email)
+    if verification_error:
+        return jsonify({"error": verification_error[0]}), verification_error[1]
+
+    if _find_duplicate_identity({"email": email}):
+        return jsonify({
+            "error": "An account with this email already exists. Please sign in instead.",
+            "code": "email_exists",
+        }), 409
+
+    password, password_hash = generate_password()
+    conn = cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "INSERT INTO vendor (email, contact_no, status, source, registered_at, password) "
+            "VALUES (%s, %s, %s, %s, NOW(), %s)",
+            (email, contact_no, STATUS_REGISTERED, SOURCE_SELF_SERVICE, password_hash),
+        )
+        vendor_id = cursor.lastrowid
+
+        # Send the credentials before committing: if the email cannot go out the vendor would have an account
+        # they can never get into, so the signup is rolled back and they can simply try again.
+        if not _send_email(
+            email,
+            "Your Vendor Central account is ready",
+            SIGNUP_CREDENTIALS_TEMPLATE,
+            {
+                "vendor_name": "Vendor",  # required by the older template; the dedicated one ignores it
+                "username": email,
+                "password": password,
+                "login_url": FRONTEND_BASE_URL,
+                "support_email": SUPPORT_EMAIL,
+            },
+        ):
+            conn.rollback()
+            return jsonify({"error": "We couldn't send your login details. Please try again in a moment."}), 502
+        conn.commit()
     except MySQLError as err:
+        if conn is not None:
+            conn.rollback()
         return jsonify({"error": str(err)}), 500
     finally:
         if cursor is not None:
@@ -465,66 +572,152 @@ def get_vendors():
         if conn is not None:
             conn.close()
 
-    return jsonify(rows), 200
+    return jsonify({"message": "Account created. Your login details have been emailed to you.", "vendor_id": vendor_id}), 201
+
+
+@app.get("/vendors/me")
+@auth.vendor_required()
+def get_my_vendor():
+    vendor = _vendor_with_progress(g.vendor["vendor_id"])
+    if vendor is None:
+        return jsonify({"error": "Vendor not found"}), 404
+    return jsonify(vendor), 200
+
+
+def _onboarding_values(data):
+    """The editable onboarding fields present in `data`, cleaned."""
+    values = {}
+    for field in ONBOARDING_FIELDS:
+        if field not in data:
+            continue
+        value = data[field]
+        values[field] = value.strip() if isinstance(value, str) else value
+        if values[field] == "":
+            values[field] = None
+    if "msme_status" in values and values["msme_status"] != "Registered":
+        values["udyam_number"] = None
+    return values
+
+
+def _save_onboarding(vendor_id, vendor_row, values):
+    """Write `values` to the vendor row and tell the open return which flagged fields the vendor has now changed."""
+    if values:
+        assignments = ", ".join(f"{field} = %s" for field in values)
+        # `name` mirrors the legal name (the enterprise app and SAP read it).
+        if "vendor_legal_name" in values:
+            assignments += ", name = %s"
+        params = [*values.values()]
+        if "vendor_legal_name" in values:
+            params.append(values["vendor_legal_name"])
+        conn = get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(f"UPDATE vendor SET {assignments} WHERE vendor_id = %s", [*params, vendor_id])
+            conn.commit()
+        finally:
+            conn.close()
+    changed = [field for field, value in values.items() if _norm(value) != _norm(vendor_row.get(field))]
+    rejections.mark_fixed(vendor_id, changed)
+
+
+def _load_vendor_row(vendor_id):
+    conn = get_connection()
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM vendor WHERE vendor_id = %s", (vendor_id,))
+        return cursor.fetchone()
+    finally:
+        conn.close()
+
+
+@app.put("/vendors/me/draft")
+@auth.vendor_required(auth.STAGE_DRAFT, auth.STAGE_RETURNED)
+def save_my_draft():
+    """Save the onboarding form as it stands (partial is fine). Only the values sent are written."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be JSON"}), 400
+
+    vendor_id = g.vendor["vendor_id"]
+    values = _onboarding_values(data)
+    # Drafts may be incomplete, so only the values actually provided are validated.
+    provided = {field: value for field, value in values.items() if value is not None}
+    validation_error = _validate_vendor_values(provided)
+    if validation_error:
+        return jsonify({"error": validation_error}), 400
+    duplicate_error = _find_duplicate_identity({"pan": values.get("pan")}, exclude_vendor_id=vendor_id)
+    if duplicate_error:
+        return jsonify({"error": duplicate_error}), 409
+
+    try:
+        _save_onboarding(vendor_id, _load_vendor_row(vendor_id), values)
+        return jsonify(_vendor_with_progress(vendor_id)), 200
+    except MySQLError as err:
+        return jsonify({"error": str(err)}), 500
+
+
+@app.post("/vendors/me/submit")
+@auth.vendor_required(auth.STAGE_DRAFT, auth.STAGE_RETURNED)
+def submit_my_application():
+    """Submit (or resubmit after a return) the application to the maker. Review then runs as for any new vendor."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be JSON"}), 400
+
+    vendor_id = g.vendor["vendor_id"]
+    try:
+        before = _load_vendor_row(vendor_id)
+        values = _onboarding_values(data.get("details") or {})
+        final = {**{field: before.get(field) for field in ONBOARDING_FIELDS}, **values}
+        final["email"] = before["email"]
+
+        missing = [field for field in REQUIRED_FIELDS if not str(final.get(field) or "").strip()]
+        if missing:
+            return jsonify({"error": f"Missing required field(s): {', '.join(missing)}", "fields": missing}), 400
+        validation_error = _validate_vendor_values({k: v for k, v in final.items() if v is not None})
+        if validation_error:
+            return jsonify({"error": validation_error}), 400
+        duplicate_error = _find_duplicate_identity({"pan": final.get("pan")}, exclude_vendor_id=vendor_id)
+        if duplicate_error:
+            return jsonify({"error": duplicate_error}), 409
+
+        _save_onboarding(vendor_id, before, values)
+
+        # A flagged field the vendor checked and kept as it was (the rejection may have been about a document,
+        # or the value was right) still counts as dealt with.
+        confirmed = data.get("confirmed_fields")
+        if isinstance(confirmed, list):
+            rejections.mark_fixed(vendor_id, [str(key) for key in confirmed])
+
+        conn = get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE vendor SET status = %s, submission_round = submission_round + 1, "
+                "submitted_at = NOW(), is_draft = 0 WHERE vendor_id = %s",
+                (STATUS_PENDING, vendor_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        rejections.mark_resubmitted(vendor_id)
+        vendor = _vendor_with_progress(vendor_id)
+    except MySQLError as err:
+        return jsonify({"error": str(err)}), 500
+
+    _send_registration_emails(
+        vendor_id,
+        vendor.get("vendor_legal_name") or vendor.get("name"),
+        vendor["email"],
+        resubmission=(vendor.get("submission_round") or 0) > 1,
+    )
+    return jsonify(vendor), 200
 
 
 @app.post("/vendors")
 def create_vendor():
-    data = request.get_json(silent=True)
-    if not data:
-        return jsonify({"error": "Request body must be JSON"}), 400
-
-    missing = [field for field in REQUIRED_FIELDS if not data.get(field)]
-    if missing:
-        return jsonify({"error": f"Missing required field(s): {', '.join(missing)}"}), 400
-
-    # Only include fields the client actually sent, so omitted columns
-    # (e.g. currency, msme_status, status) fall back to their DB defaults
-    # instead of being explicitly inserted as NULL.
-    values = {field: data[field] for field in VENDOR_FIELDS if data.get(field) is not None}
-    if values.get("msme_status") != "Registered":
-        values.pop("udyam_number", None)
-    validation_error = _validate_vendor_values(values)
-    if validation_error:
-        return jsonify({"error": validation_error}), 400
-
-    # The email must have been verified through the shared service (code or link) for this very address.
-    verification_error = _verified_email_error(data.get("verification_id"), values.get("email"))
-    if verification_error:
-        return jsonify({"error": verification_error[0]}), verification_error[1]
-
-    # The form checks these as you type, but a vendor must never be created with a PAN /
-    # email that already belongs to another vendor, whatever the client sent.
-    duplicate_error = _find_duplicate_identity(values)
-    if duplicate_error:
-        return jsonify({"error": duplicate_error}), 409
-
-    columns = ", ".join(values.keys())
-    placeholders = ", ".join(["%s"] * len(values))
-    sql = f"INSERT INTO vendor ({columns}) VALUES ({placeholders})"
-
-    try:
-        conn = get_connection()
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute(sql, list(values.values()))
-        conn.commit()
-        new_vendor_id = cursor.lastrowid
-
-        cursor.execute("SELECT * FROM vendor WHERE vendor_id = %s", (new_vendor_id,))
-        row = cursor.fetchone()
-        cursor.close()
-        conn.close()
-    except MySQLError as err:
-        return jsonify({"error": str(err)}), 500
-
-    if row.get("email"):
-        _send_registration_emails(
-            new_vendor_id,
-            row.get("vendor_legal_name") or row.get("name"),
-            row["email"],
-        )
-
-    return jsonify(row), 201
+    # Replaced by POST /vendors/signup + the onboarding form (PUT /vendors/me/draft, POST /vendors/me/submit).
+    return jsonify({"error": "Vendor requests now start with signup. Use POST /vendors/signup."}), 410
 
 
 # Supporting documents uploaded with an onboarding request, kept in the Azure Blob container named by
@@ -566,6 +759,7 @@ def _docs_container():
 
 
 @app.post("/vendors/<int:vendor_id>/documents")
+@auth.vendor_required(auth.STAGE_DRAFT, auth.STAGE_RETURNED)
 def upload_vendor_documents(vendor_id):
     conn = cursor = None
     try:
@@ -583,9 +777,6 @@ def upload_vendor_documents(vendor_id):
 
     if vendor is None:
         return jsonify({"error": "Vendor not found"}), 404
-    # Onboarding documents are for a request still in review; an approved vendor's record is not added to this way.
-    if _norm(vendor.get("status")).lower() == "active":
-        return jsonify({"error": "Documents can only be added to a request that is still awaiting approval."}), 409
 
     unknown = [key for key in request.files if key not in DOCUMENT_TYPES]
     if unknown:
@@ -619,8 +810,11 @@ def upload_vendor_documents(vendor_id):
     uploaded_blobs = []
     saved = []
     try:
-        existing = sum(1 for _ in container.list_blobs(name_starts_with=prefix))
-        if existing + len(staged) > DOCUMENT_MAX_PER_VENDOR:
+        existing_blobs = list(container.list_blobs(name_starts_with=prefix))
+        # Uploading a document type replaces what was on file for it (a vendor fixing a returned application).
+        replaced_prefixes = {f"{prefix}{doc_type}_" for doc_type, *_ in staged}
+        replaced_blobs = [blob.name for blob in existing_blobs if blob.name.startswith(tuple(replaced_prefixes))]
+        if len(existing_blobs) - len(replaced_blobs) + len(staged) > DOCUMENT_MAX_PER_VENDOR:
             return jsonify({"error": "This request already has the maximum number of documents."}), 400
 
         for doc_type, original_name, extension, content in staged:
@@ -657,7 +851,39 @@ def upload_vendor_documents(vendor_id):
                 app.logger.exception("Could not remove %s after a failed upload", blob_name)
         return jsonify({"error": "Unable to save the documents. Please try again."}), 502
 
+    for blob_name in replaced_blobs:
+        try:
+            container.delete_blob(blob_name)
+        except AzureError:
+            app.logger.exception("Could not remove the replaced document %s", blob_name)
+
+    # A replaced document answers a "doc_<type>" flag on the open return.
+    rejections.mark_fixed(vendor_id, [f"doc_{item['type']}" for item in saved])
     return jsonify({"documents": saved}), 201
+
+
+@app.get("/vendors/me/documents")
+@auth.vendor_required(auth.STAGE_DRAFT, auth.STAGE_RETURNED)
+def list_my_documents():
+    """The supporting documents already on file, so the form can show them and offer to replace them."""
+    vendor_id = g.vendor["vendor_id"]
+    container = _docs_container()
+    if container is None:
+        return jsonify({"documents": [], "storage_configured": False}), 200
+    documents = []
+    try:
+        for blob in container.list_blobs(name_starts_with=f"vendor_{vendor_id}/", include=["metadata"]):
+            metadata = blob.metadata or {}
+            documents.append({
+                "type": metadata.get("doc_type"),
+                "original_name": unquote(metadata.get("original_name") or blob.name.rsplit("/", 1)[-1]),
+                "size": blob.size,
+                "uploaded_at": metadata.get("uploaded_at"),
+            })
+    except AzureError:
+        app.logger.exception("Listing documents for vendor %s failed", vendor_id)
+        return jsonify({"error": "Unable to load your documents right now."}), 502
+    return jsonify({"documents": documents, "storage_configured": True}), 200
 
 
 # Profile fields a vendor may ask to change. Email is the login name, so it is not editable here.
@@ -685,6 +911,7 @@ def update_vendor():
 
 
 @app.post("/vendors/update-requests")
+@auth.vendor_required(auth.STAGE_ACTIVE)
 def create_update_request():
     data = request.get_json(silent=True) or {}
     vendor_id = data.get("vendor_id")
@@ -762,6 +989,7 @@ def create_update_request():
 
 
 @app.get("/vendors/update-requests")
+@auth.vendor_required(auth.STAGE_ACTIVE)
 def list_update_requests():
     vendor_id = request.args.get("vendor_id")
     if not vendor_id:
@@ -771,125 +999,10 @@ def list_update_requests():
 
 @app.post("/vendors/approval")
 def approve_vendor():
-    data = request.get_json(silent=True) or {}
+    # Approval belongs to the maker/checker app, which also creates the SAP vendor. Vendors now get their
+    # credentials at signup, so this open endpoint (which used to issue a new password) is retired.
+    return jsonify({"error": "Vendor approval is done in the maker/checker app."}), 410
 
-    vendor_id = data.get("vendor_id")
-    status_code = data.get("status")
-
-    if vendor_id is None:
-        return jsonify({"error": "vendor_id is required"}), 400
-
-    # JSON numbers cannot have leading zeroes, so support both 1/2 and
-    # the string codes "01"/"02".
-    if isinstance(status_code, bool):
-        normalized_status_code = None
-    elif isinstance(status_code, int):
-        normalized_status_code = f"{status_code:02d}"
-    elif isinstance(status_code, str):
-        normalized_status_code = status_code.strip().zfill(2)
-    else:
-        normalized_status_code = None
-
-    if normalized_status_code not in {"01", "02"}:
-        return jsonify({"error": "status must be 01 or 02"}), 400
-
-    conn = None
-    cursor = None
-    try:
-        conn = get_connection()
-        cursor = conn.cursor(dictionary=True)
-
-        cursor.execute(
-            "SELECT vendor_id, email, vendor_legal_name, status FROM vendor "
-            "WHERE vendor_id = %s FOR UPDATE",
-            (vendor_id,),
-        )
-        vendor = cursor.fetchone()
-
-        if not vendor:
-            return jsonify({"error": "Vendor not found"}), 404
-
-        current_status = vendor["status"]
-        normalized_current_status = str(current_status).strip().lower()
-
-        if normalized_status_code == "01":
-            if normalized_current_status != "pending":
-                return jsonify(
-                    {
-                        "error": "Status 01 is only valid for a pending vendor",
-                        "current_status": current_status,
-                    }
-                ), 409
-
-            cursor.execute(
-                "UPDATE vendor SET status = %s WHERE vendor_id = %s",
-                ("sent for approval", vendor_id),
-            )
-            conn.commit()
-            new_status = "sent for approval"
-            message = "Vendor sent for approval"
-        else:
-            if normalized_current_status != "sent for approval":
-                return jsonify(
-                    {
-                        "error": (
-                            "Status 02 is only valid for a vendor that has been "
-                            "sent for approval"
-                        ),
-                        "current_status": current_status,
-                    }
-                ), 409
-
-            password, password_hash = generate_unique_password(cursor)
-            cursor.execute(
-                "UPDATE vendor SET status = %s, password = %s WHERE vendor_id = %s",
-                ("active", password_hash, vendor_id),
-            )
-            conn.commit()
-            new_status = "active"
-            message = "Vendor approved successfully"
-
-            email_sent = True
-            try:
-                requests.post(
-                    EMAIL_API_URL,
-                    json={
-                        "to": vendor["email"],
-                        "subject": "Your vendor account is ready",
-                        "template_name": "vendor_account_onboarding",
-                        "params": {
-                            "vendor_name": vendor["vendor_legal_name"],
-                            "username": vendor["email"],
-                            "password": password,
-                            "login_url": "http://localhost:5173/",
-                            "support_email": "support@fourthsignal.com",
-                        },
-                    },
-                    timeout=10,
-                ).raise_for_status()
-            except requests.RequestException:
-                email_sent = False
-        response = {
-            "message": message,
-            "vendor_id": vendor_id,
-            "email": vendor["email"],
-            "status": new_status,
-        }
-        if normalized_status_code == "02":
-            response["password"] = password
-            response["email_sent"] = email_sent
-
-        return jsonify(response), 200
-
-    except (MySQLError, RuntimeError) as err:
-        if conn is not None:
-            conn.rollback()
-        return jsonify({"error": str(err)}), 500
-    finally:
-        if cursor is not None:
-            cursor.close()
-        if conn is not None:
-            conn.close()
 
 @app.post("/vendors/check-email")
 def check_vendor_email():
@@ -971,28 +1084,41 @@ def login_vendor():
     if not isinstance(password, str) or not password:
         return jsonify({"error": "password is required"}), 400
 
+    wait = auth.login_blocked_for(email)
+    if wait:
+        response = jsonify({"error": "Too many failed attempts. Please try again in a few minutes."})
+        response.status_code = 429
+        response.headers["Retry-After"] = str(wait)
+        return response
+
     conn = None
     cursor = None
     try:
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
+        # Any vendor with credentials can sign in; what they can do afterwards depends on their stage.
         cursor.execute(
-            "SELECT vendor_id, email, password FROM vendor "
-            "WHERE email = %s AND status = %s LIMIT 1",
-            (email.strip(), "active"),
+            "SELECT vendor_id, email, password, status, submission_round FROM vendor "
+            "WHERE LOWER(TRIM(email)) = %s AND password IS NOT NULL LIMIT 1",
+            (email.strip().lower(),),
         )
         vendor = cursor.fetchone()
 
         submitted_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
         stored_hash = vendor.get("password") if vendor else None
         if not stored_hash or not hmac.compare_digest(str(stored_hash), submitted_hash):
+            auth.record_login_failure(email)
             return jsonify({"error": "Invalid email or password"}), 401
 
+        auth.clear_login_failures(email)
         return jsonify(
             {
                 "message": "Login successful",
                 "vendor_id": vendor["vendor_id"],
                 "email": vendor["email"],
+                "status": vendor["status"],
+                "stage": auth.stage_for(vendor["status"], vendor.get("submission_round")),
+                "token": auth.issue_token(vendor["vendor_id"], vendor["email"]),
             }
         ), 200
     except MySQLError as err:
@@ -1019,9 +1145,11 @@ def check_vendor_pan():
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
 
+        # A vendor filling in their own form must not be told their own saved PAN is a duplicate.
+        own_id = auth.current_vendor_id()
         cursor.execute(
-            "SELECT vendor_id FROM vendor WHERE UPPER(TRIM(pan)) = %s LIMIT 1",
-            (normalized_pan,),
+            "SELECT vendor_id FROM vendor WHERE UPPER(TRIM(pan)) = %s AND vendor_id <> %s LIMIT 1",
+            (normalized_pan, own_id if own_id is not None else -1),
         )
         vendor = cursor.fetchone()
 
@@ -1040,6 +1168,7 @@ def check_vendor_pan():
 
 
 @app.post("/invoices/ocr")
+@auth.vendor_required(auth.STAGE_ACTIVE)
 def upload_invoice_for_ocr():
     vendor_id = request.form.get("vendor_id", "").strip()
     invoice_file = request.files.get("invoices")
@@ -1318,6 +1447,7 @@ def upload_invoice_for_ocr():
 
 
 @app.get("/invoices")
+@auth.vendor_required(auth.STAGE_ACTIVE)
 def get_invoices():
     vendor_id = request.args.get("vendor_id")
     if not vendor_id:
