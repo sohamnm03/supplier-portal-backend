@@ -156,7 +156,8 @@ def _find_duplicate_identity(values, exclude_vendor_id=None):
             if not values.get(field) or not str(values[field]).strip():
                 continue
             cursor.execute(
-                f"SELECT vendor_id FROM vendor WHERE {column_sql} = %s AND vendor_id <> %s LIMIT 1",
+                # A rejected application no longer holds its email or PAN, so the vendor can apply again.
+                f"SELECT vendor_id FROM vendor WHERE {column_sql} = %s AND vendor_id <> %s AND LOWER(status) <> 'rejected' LIMIT 1",
                 (normalise(values[field]), exclude_vendor_id if exclude_vendor_id is not None else -1),
             )
             if cursor.fetchone():
@@ -191,6 +192,12 @@ def _validate_vendor_values(values, existing=None):
     final = {**(existing or {}), **values}
     if final.get("msme_status") == "Registered" and not str(final.get("udyam_number") or "").strip():
         return "udyam_number is required when msme_status is Registered"
+    # CIN is a 21-character code and the Udyam number column holds 30: anything else would only fail in the database.
+    cin = str(final.get("cin") or "").strip()
+    if cin and not re.fullmatch(r"[A-Za-z0-9]{21}", cin):
+        return "cin must be a 21-character CIN"
+    if len(str(final.get("udyam_number") or "").strip()) > 30:
+        return "udyam_number is too long"
     return None
 
 
@@ -342,7 +349,8 @@ def _email_verification_request(method, path, **kwargs):
             method,
             f"{EMAIL_VERIFICATION_API_URL}{path}",
             headers=_email_verification_headers(),
-            timeout=15,
+            # Sending the code can take 20+ seconds on the shared service (it waits for the mail server).
+            timeout=45,
             **kwargs,
         )
     except requests.RequestException as err:
@@ -505,7 +513,9 @@ def _vendor_with_progress(vendor_id):
 
     vendor = _serialize_row(row)
     vendor["stage"] = auth.stage_for(vendor.get("status"), vendor.get("submission_round"))
-    vendor["rejection"] = rejections.get_open_rejection(vendor_id) if vendor["stage"] == auth.STAGE_RETURNED else None
+    vendor["rejection"] = (
+        rejections.get_open_rejection(vendor_id) if vendor["stage"] in (auth.STAGE_RETURNED, auth.STAGE_REJECTED) else None
+    )
     # The rejecter's name is internal; the vendor only learns whether it was the maker's or checker's review.
     return vendor
 
@@ -544,6 +554,12 @@ def signup_vendor():
             (email, contact_no, STATUS_REGISTERED, SOURCE_SELF_SERVICE, password_hash),
         )
         vendor_id = cursor.lastrowid
+        # A vendor whose earlier application was rejected is applying again: that application stays as history, but its
+        # login is retired so the new account is the only one this email can sign in to.
+        cursor.execute(
+            "UPDATE vendor SET password = NULL WHERE LOWER(TRIM(email)) = %s AND LOWER(status) = 'rejected' AND vendor_id <> %s",
+            (email.lower(), vendor_id),
+        )
 
         # Send the credentials before committing: if the email cannot go out the vendor would have an account
         # they can never get into, so the signup is rolled back and they can simply try again.
@@ -596,6 +612,8 @@ def _onboarding_values(data):
             values[field] = None
     if "msme_status" in values and values["msme_status"] != "Registered":
         values["udyam_number"] = None
+    if isinstance(values.get("cin"), str):
+        values["cin"] = values["cin"].upper()
     return values
 
 
@@ -1021,7 +1039,7 @@ def check_vendor_email():
         cursor = conn.cursor(dictionary=True)
 
         cursor.execute(
-            "SELECT vendor_id FROM vendor WHERE LOWER(TRIM(email)) = %s LIMIT 1",
+            "SELECT vendor_id FROM vendor WHERE LOWER(TRIM(email)) = %s AND LOWER(status) <> 'rejected' LIMIT 1",
             (normalized_email,),
         )
         vendor = cursor.fetchone()
@@ -1099,7 +1117,8 @@ def login_vendor():
         # Any vendor with credentials can sign in; what they can do afterwards depends on their stage.
         cursor.execute(
             "SELECT vendor_id, email, password, status, submission_round FROM vendor "
-            "WHERE LOWER(TRIM(email)) = %s AND password IS NOT NULL LIMIT 1",
+            "WHERE LOWER(TRIM(email)) = %s AND password IS NOT NULL "
+            "ORDER BY (LOWER(status) = 'rejected'), vendor_id DESC LIMIT 1",
             (email.strip().lower(),),
         )
         vendor = cursor.fetchone()
@@ -1111,13 +1130,17 @@ def login_vendor():
             return jsonify({"error": "Invalid email or password"}), 401
 
         auth.clear_login_failures(email)
+        stage = auth.stage_for(vendor["status"], vendor.get("submission_round"))
+        if stage == auth.STAGE_REJECTED:
+            # No session for a rejected application. The vendor is told why and can start a new application.
+            return jsonify({"error": "Your application was not approved.", "code": "application_rejected"}), 403
         return jsonify(
             {
                 "message": "Login successful",
                 "vendor_id": vendor["vendor_id"],
                 "email": vendor["email"],
                 "status": vendor["status"],
-                "stage": auth.stage_for(vendor["status"], vendor.get("submission_round")),
+                "stage": stage,
                 "token": auth.issue_token(vendor["vendor_id"], vendor["email"]),
             }
         ), 200
@@ -1148,7 +1171,7 @@ def check_vendor_pan():
         # A vendor filling in their own form must not be told their own saved PAN is a duplicate.
         own_id = auth.current_vendor_id()
         cursor.execute(
-            "SELECT vendor_id FROM vendor WHERE UPPER(TRIM(pan)) = %s AND vendor_id <> %s LIMIT 1",
+            "SELECT vendor_id FROM vendor WHERE UPPER(TRIM(pan)) = %s AND vendor_id <> %s AND LOWER(status) <> 'rejected' LIMIT 1",
             (normalized_pan, own_id if own_id is not None else -1),
         )
         vendor = cursor.fetchone()
