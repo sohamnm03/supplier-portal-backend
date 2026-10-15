@@ -1190,43 +1190,15 @@ def check_vendor_pan():
             conn.close()
 
 
-@app.post("/invoices/ocr")
-@auth.vendor_required(auth.STAGE_ACTIVE)
-def upload_invoice_for_ocr():
-    vendor_id = request.form.get("vendor_id", "").strip()
-    invoice_file = request.files.get("invoices")
+def _extract_invoice_from_ocr(invoice_file, file_bytes, vendor_id):
+    """Send the file to the shared OCR service and turn its answer into database values.
 
-    if not vendor_id:
-        return jsonify({"error": "vendor_id is required"}), 400
-    if invoice_file is None or not invoice_file.filename:
-        return jsonify({"error": "invoices file is required"}), 400
-
-    # Reject an invalid vendor before uploading the file to the OCR service.
-    validation_conn = None
-    validation_cursor = None
-    try:
-        validation_conn = get_connection()
-        validation_cursor = validation_conn.cursor(dictionary=True)
-        validation_cursor.execute(
-            "SELECT vendor_id, email, vendor_legal_name FROM vendor "
-            "WHERE vendor_id = %s LIMIT 1",
-            (vendor_id,),
-        )
-        vendor_row = validation_cursor.fetchone()
-        if vendor_row is None:
-            return jsonify({"error": "Vendor not found"}), 404
-    except MySQLError as err:
-        return jsonify({"error": str(err)}), 500
-    finally:
-        if validation_cursor is not None:
-            validation_cursor.close()
-        if validation_conn is not None:
-            validation_conn.close()
-
-    file_bytes = invoice_file.read()
-    if not file_bytes:
-        return jsonify({"error": "invoices file must not be empty"}), 400
-
+    Shared by POST /invoices/ocr (insert) and POST /invoices/<id>/replace (overwrite).
+    Returns (parsed, None) on success, or (None, (json_body, http_status)) when OCR fails so
+    the caller can return that error unchanged. `parsed` holds: file_id, invoice_values (the
+    invoices columns), tax_rows and line_rows (tuples WITHOUT the leading invoice_id, see
+    _insert_invoice_children), invoice_number and ocr_data.
+    """
     file_id = f"invoice-{uuid.uuid4().hex}"
     file_sha256 = hashlib.sha256(file_bytes).hexdigest()
 
@@ -1252,14 +1224,12 @@ def upload_invoice_for_ocr():
                 details = err.response.json()
             except ValueError:
                 details = err.response.text[:1000]
-        return jsonify(
-            {"error": "Invoice OCR request failed", "details": details}
-        ), 502
+        return None, ({"error": "Invoice OCR request failed", "details": details}, 502)
     except ValueError:
-        return jsonify({"error": "Invoice OCR service returned invalid JSON"}), 502
+        return None, ({"error": "Invoice OCR service returned invalid JSON"}, 502)
 
     if not isinstance(ocr_data, dict):
-        return jsonify({"error": "Invoice OCR service returned an invalid response"}), 502
+        return None, ({"error": "Invoice OCR service returned an invalid response"}, 502)
 
     results = ocr_data.get("results") or []
     result = results[0] if results and isinstance(results[0], dict) else {}
@@ -1362,6 +1332,127 @@ def upload_invoice_for_ocr():
         "blob_name": blob_name,
     }
 
+    tax_rows = [
+        (
+            tax.get("tax_type") or tax.get("tax_desc"),
+            tax.get("tax_description") or tax.get("tax_desc"),
+            _decimal_value(tax.get("rate")),
+            _decimal_value(tax.get("amount")),
+        )
+        for tax in invoice_data.get("tax_details") or []
+    ]
+
+    line_rows = []
+    normalized_items = invoice_data.get("line_items") or []
+    source_items = invoice_data.get("items") or []
+    line_items = normalized_items or source_items
+    for index, line_item in enumerate(line_items, start=1):
+        source_item = source_items[index - 1] if index <= len(source_items) else {}
+        combined_item = {**source_item, **line_item}
+        raw_tax = combined_item.get("tax")
+        tax_amount = (
+            _decimal_value(raw_tax.get("amount"))
+            if isinstance(raw_tax, dict)
+            else _decimal_value(raw_tax)
+        )
+        extracted_tax_text = (
+            _json_value(raw_tax) if isinstance(raw_tax, (dict, list)) else raw_tax
+        )
+        line_rows.append(
+            (
+                index,
+                combined_item.get("product_code"),
+                combined_item.get("description"),
+                _date_value(combined_item.get("date")),
+                _decimal_value(combined_item.get("quantity")),
+                combined_item.get("unit"),
+                _decimal_value(combined_item.get("unit_price")),
+                _decimal_value(
+                    combined_item.get("taxable_amount") or combined_item.get("amount")
+                ),
+                tax_amount,
+                _decimal_value(
+                    combined_item.get("total_amount") or combined_item.get("amount")
+                ),
+                extracted_tax_text,
+                _json_value(combined_item),
+            )
+        )
+
+    return {
+        "file_id": file_id,
+        "invoice_values": invoice_values,
+        "tax_rows": tax_rows,
+        "line_rows": line_rows,
+        "invoice_number": invoice_number,
+        "ocr_data": ocr_data,
+    }, None
+
+
+def _insert_invoice_children(cursor, invoice_id, tax_rows, line_rows):
+    for tax_row in tax_rows:
+        cursor.execute(
+            "INSERT INTO invoice_tax_details "
+            "(invoice_id, tax_type, tax_description, tax_rate, tax_amount) "
+            "VALUES (%s, %s, %s, %s, %s)",
+            (invoice_id, *tax_row),
+        )
+    for line_row in line_rows:
+        cursor.execute(
+            "INSERT INTO invoice_line_items "
+            "(invoice_id, line_number, product_code, description, item_date, "
+            "quantity, unit, unit_price, taxable_amount, tax_amount, "
+            "total_amount, extracted_tax_text, raw_item_data) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (invoice_id, *line_row),
+        )
+
+
+@app.post("/invoices/ocr")
+@auth.vendor_required(auth.STAGE_ACTIVE)
+def upload_invoice_for_ocr():
+    vendor_id = request.form.get("vendor_id", "").strip()
+    invoice_file = request.files.get("invoices")
+
+    if not vendor_id:
+        return jsonify({"error": "vendor_id is required"}), 400
+    if invoice_file is None or not invoice_file.filename:
+        return jsonify({"error": "invoices file is required"}), 400
+
+    # Reject an invalid vendor before uploading the file to the OCR service.
+    validation_conn = None
+    validation_cursor = None
+    try:
+        validation_conn = get_connection()
+        validation_cursor = validation_conn.cursor(dictionary=True)
+        validation_cursor.execute(
+            "SELECT vendor_id, email, vendor_legal_name FROM vendor "
+            "WHERE vendor_id = %s LIMIT 1",
+            (vendor_id,),
+        )
+        vendor_row = validation_cursor.fetchone()
+        if vendor_row is None:
+            return jsonify({"error": "Vendor not found"}), 404
+    except MySQLError as err:
+        return jsonify({"error": str(err)}), 500
+    finally:
+        if validation_cursor is not None:
+            validation_cursor.close()
+        if validation_conn is not None:
+            validation_conn.close()
+
+    file_bytes = invoice_file.read()
+    if not file_bytes:
+        return jsonify({"error": "invoices file must not be empty"}), 400
+
+    parsed, ocr_error = _extract_invoice_from_ocr(invoice_file, file_bytes, vendor_id)
+    if ocr_error is not None:
+        return jsonify(ocr_error[0]), ocr_error[1]
+    file_id = parsed["file_id"]
+    invoice_values = parsed["invoice_values"]
+    invoice_number = parsed["invoice_number"]
+    ocr_data = parsed["ocr_data"]
+
     conn = None
     cursor = None
     try:
@@ -1380,65 +1471,9 @@ def upload_invoice_for_ocr():
             "UPDATE invoices SET inv_ref_gen = %s WHERE id = %s",
             (_generate_invoice_reference(database_invoice_id), database_invoice_id),
         )
-
-        for tax in invoice_data.get("tax_details") or []:
-            cursor.execute(
-                "INSERT INTO invoice_tax_details "
-                "(invoice_id, tax_type, tax_description, tax_rate, tax_amount) "
-                "VALUES (%s, %s, %s, %s, %s)",
-                (
-                    database_invoice_id,
-                    tax.get("tax_type") or tax.get("tax_desc"),
-                    tax.get("tax_description") or tax.get("tax_desc"),
-                    _decimal_value(tax.get("rate")),
-                    _decimal_value(tax.get("amount")),
-                ),
-            )
-
-        normalized_items = invoice_data.get("line_items") or []
-        source_items = invoice_data.get("items") or []
-        line_items = normalized_items or source_items
-        for index, line_item in enumerate(line_items, start=1):
-            source_item = source_items[index - 1] if index <= len(source_items) else {}
-            combined_item = {**source_item, **line_item}
-            raw_tax = combined_item.get("tax")
-            tax_amount = (
-                _decimal_value(raw_tax.get("amount"))
-                if isinstance(raw_tax, dict)
-                else _decimal_value(raw_tax)
-            )
-            extracted_tax_text = (
-                _json_value(raw_tax) if isinstance(raw_tax, (dict, list)) else raw_tax
-            )
-            cursor.execute(
-                "INSERT INTO invoice_line_items "
-                "(invoice_id, line_number, product_code, description, item_date, "
-                "quantity, unit, unit_price, taxable_amount, tax_amount, "
-                "total_amount, extracted_tax_text, raw_item_data) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                (
-                    database_invoice_id,
-                    index,
-                    combined_item.get("product_code"),
-                    combined_item.get("description"),
-                    _date_value(combined_item.get("date")),
-                    _decimal_value(combined_item.get("quantity")),
-                    combined_item.get("unit"),
-                    _decimal_value(combined_item.get("unit_price")),
-                    _decimal_value(
-                        combined_item.get("taxable_amount")
-                        or combined_item.get("amount")
-                    ),
-                    tax_amount,
-                    _decimal_value(
-                        combined_item.get("total_amount")
-                        or combined_item.get("amount")
-                    ),
-                    extracted_tax_text,
-                    _json_value(combined_item),
-                ),
-            )
-
+        _insert_invoice_children(
+            cursor, database_invoice_id, parsed["tax_rows"], parsed["line_rows"]
+        )
         conn.commit()
     except (MySQLError, TypeError, ValueError) as err:
         if conn is not None:
@@ -1469,6 +1504,220 @@ def upload_invoice_for_ocr():
     ), 201
 
 
+# MySQL errors meaning "the new return/replace tables or columns are not there yet".
+_MISSING_SCHEMA_ERRNOS = (1146, 1054)  # ER_NO_SUCH_TABLE, ER_BAD_FIELD_ERROR
+
+
+def _owned_invoice_id(cursor, invoice_id):
+    """The invoice row id if this vendor uploaded it (invoices.vendor_id is the numeric id stored as text)."""
+    cursor.execute(
+        "SELECT id FROM invoices WHERE id = %s AND vendor_id = %s LIMIT 1",
+        (invoice_id, str(g.vendor["vendor_id"])),
+    )
+    return cursor.fetchone()
+
+
+def _vendor_return_payload(cursor, invoice_id):
+    """Latest open return-to-vendor, else latest rejection, else None, shaped for the vendor.
+
+    Internal wording (items with internal_only = 1) and who returned it never leave this function.
+    """
+    columns = "return_id, outcome, returned_at, overall_remark"
+    cursor.execute(
+        f"SELECT {columns} FROM invoice_return WHERE invoice_id = %s AND outcome = 'returned' "
+        "AND returned_to = 'vendor' AND resolved_at IS NULL "
+        "ORDER BY returned_at DESC, return_id DESC LIMIT 1",
+        (invoice_id,),
+    )
+    header = cursor.fetchone()
+    if header is None:
+        cursor.execute(
+            f"SELECT {columns} FROM invoice_return WHERE invoice_id = %s AND outcome = 'rejected' "
+            "ORDER BY returned_at DESC, return_id DESC LIMIT 1",
+            (invoice_id,),
+        )
+        header = cursor.fetchone()
+    if header is None:
+        return None
+
+    cursor.execute(
+        "SELECT item_id, field_key, field_label, reason_label, internal_only, remark, fixed_at "
+        "FROM invoice_return_item WHERE return_id = %s ORDER BY item_id",
+        (header["return_id"],),
+    )
+    all_items = cursor.fetchall()
+    items = [
+        {
+            "item_id": row["item_id"],
+            "field_key": row["field_key"],
+            "field_label": row["field_label"],
+            "reason_label": row["reason_label"],
+            "remark": row["remark"],
+            "fixed": row["fixed_at"] is not None,
+        }
+        for row in all_items
+        if not row["internal_only"]
+    ]
+    if all_items and not items:
+        items = [
+            {
+                "item_id": 0,
+                "field_key": "file",
+                "field_label": "Invoice",
+                "reason_label": "Our team needs a corrected invoice",
+                "remark": None,
+                "fixed": False,
+            }
+        ]
+    returned_at = header["returned_at"]
+    return {
+        "return_id": header["return_id"],
+        "outcome": header["outcome"],
+        "returned_at": returned_at.isoformat() if isinstance(returned_at, (datetime, date)) else returned_at,
+        "overall_remark": header["overall_remark"],
+        "items": items,
+    }
+
+
+@app.get("/invoices/<int:invoice_id>/return-reasons")
+@auth.vendor_required(auth.STAGE_ACTIVE)
+def get_invoice_return_reasons(invoice_id):
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        if _owned_invoice_id(cursor, invoice_id) is None:
+            return jsonify({"error": "Invoice not found"}), 404
+        try:
+            payload = _vendor_return_payload(cursor, invoice_id)
+        except MySQLError as err:
+            # The invoice_return tables are created separately by the DBA; until then there is nothing to show.
+            if getattr(err, "errno", None) not in _MISSING_SCHEMA_ERRNOS:
+                raise
+            payload = None
+    except MySQLError as err:
+        return jsonify({"error": str(err)}), 500
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+    return jsonify(payload), 200
+
+
+@app.post("/invoices/<int:invoice_id>/replace")
+@auth.vendor_required(auth.STAGE_ACTIVE)
+def replace_invoice(invoice_id):
+    invoice_file = request.files.get("invoices")
+    if invoice_file is None or not invoice_file.filename:
+        return jsonify({"error": "invoices file is required"}), 400
+    file_bytes = invoice_file.read()
+    if not file_bytes:
+        return jsonify({"error": "invoices file must not be empty"}), 400
+
+    vendor_id = str(g.vendor["vendor_id"])
+    vendor_email = g.vendor.get("email")
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        if _owned_invoice_id(cursor, invoice_id) is None:
+            return jsonify({"error": "Invoice not found"}), 404
+        cursor.execute("SELECT status FROM invoices WHERE id = %s", (invoice_id,))
+        current = cursor.fetchone() or {}
+        if current.get("status") != "Returned to Vendor":
+            return jsonify(
+                {"error": "This invoice has not been returned to you, so it cannot be replaced."}
+            ), 409
+        cursor.execute(
+            "SELECT vendor_legal_name FROM vendor WHERE vendor_id = %s LIMIT 1", (vendor_id,)
+        )
+        vendor_name = (cursor.fetchone() or {}).get("vendor_legal_name")
+    except MySQLError as err:
+        return jsonify({"error": str(err)}), 500
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+
+    parsed, ocr_error = _extract_invoice_from_ocr(invoice_file, file_bytes, vendor_id)
+    if ocr_error is not None:
+        return jsonify(ocr_error[0]), ocr_error[1]
+    invoice_values = parsed["invoice_values"]
+
+    # id, vendor_id, inv_ref_gen and created_at are never written; the row keeps its identity.
+    updates = {k: v for k, v in invoice_values.items() if k not in ("vendor_id", "status")}
+    set_clause = ", ".join(f"{column} = %s" for column in updates)
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        # Back to the start of the approval chain (the maker's queue) whoever returned it, with the G/L account and tax code
+        # cleared for the maker to assign again; it then goes to the checker and, if needed, the authorizer as usual.
+        cursor.execute(
+            f"UPDATE invoices SET {set_clause}, gl_account = NULL, tax_code = NULL, "
+            "status = 'Pending Approval', replaced_at = NOW(), "
+            "submission_round = submission_round + 1 "
+            "WHERE id = %s AND vendor_id = %s AND status = 'Returned to Vendor'",
+            [*updates.values(), invoice_id, vendor_id],
+        )
+        if cursor.rowcount == 0:
+            # The invoice changed state while the OCR ran.
+            conn.rollback()
+            return jsonify(
+                {"error": "This invoice has not been returned to you, so it cannot be replaced."}
+            ), 409
+        cursor.execute("DELETE FROM invoice_tax_details WHERE invoice_id = %s", (invoice_id,))
+        cursor.execute("DELETE FROM invoice_line_items WHERE invoice_id = %s", (invoice_id,))
+        _insert_invoice_children(cursor, invoice_id, parsed["tax_rows"], parsed["line_rows"])
+        cursor.execute(
+            "UPDATE invoice_return_item i JOIN invoice_return r ON r.return_id = i.return_id "
+            "SET i.fixed_at = NOW() "
+            "WHERE r.invoice_id = %s AND r.returned_to = 'vendor' AND r.resolved_at IS NULL "
+            "AND i.fixed_at IS NULL",
+            (invoice_id,),
+        )
+        cursor.execute(
+            "UPDATE invoice_return SET resolved_at = NOW() "
+            "WHERE invoice_id = %s AND returned_to = 'vendor' AND resolved_at IS NULL",
+            (invoice_id,),
+        )
+        conn.commit()
+    except (MySQLError, TypeError, ValueError) as err:
+        if conn is not None:
+            conn.rollback()
+        return jsonify({"error": f"Unable to save OCR response: {err}"}), 500
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+
+    if vendor_email:
+        _send_invoice_emails(
+            vendor_name,
+            vendor_email,
+            parsed["invoice_number"] or invoice_file.filename,
+            invoice_values["total_amount"],
+            invoice_values["currency"],
+        )
+
+    return jsonify(
+        {
+            "message": "Invoice replaced and sent for review again",
+            "invoice_id": invoice_id,
+            "file_id": parsed["file_id"],
+            "ocr_response": parsed["ocr_data"],
+        }
+    ), 200
+
+
 @app.get("/invoices")
 @auth.vendor_required(auth.STAGE_ACTIVE)
 def get_invoices():
@@ -1493,17 +1742,24 @@ def get_invoices():
         # on the vendor's behalf (stored with vendor_id = 'maker', matched by GSTIN).
         if vendor_gstin:
             cursor.execute(
-                "SELECT * FROM invoices WHERE vendor_id = %s "
-                "OR (vendor_id = %s AND UPPER(TRIM(vendor_tax_id)) = %s) "
-                "ORDER BY id",
+                "SELECT id FROM invoices WHERE vendor_id = %s "
+                "OR (vendor_id = %s AND UPPER(TRIM(vendor_tax_id)) = %s)",
                 (vendor_id, MAKER_VENDOR_ID, vendor_gstin),
             )
         else:
+            cursor.execute("SELECT id FROM invoices WHERE vendor_id = %s", (vendor_id,))
+        # Only the ids are filtered and sorted in SQL: sorting whole rows (they carry the large OCR
+        # response) made MySQL fail with "Out of sort memory". The rows are fetched by primary key.
+        matching_ids = sorted(row["id"] for row in cursor.fetchall())
+        invoices = []
+        for start in range(0, len(matching_ids), 200):
+            chunk = matching_ids[start:start + 200]
             cursor.execute(
-                "SELECT * FROM invoices WHERE vendor_id = %s ORDER BY id",
-                (vendor_id,),
+                f"SELECT * FROM invoices WHERE id IN ({', '.join(['%s'] * len(chunk))})",
+                chunk,
             )
-        invoices = cursor.fetchall()
+            invoices.extend(cursor.fetchall())
+        invoices.sort(key=lambda invoice: invoice["id"])
 
         if not invoices:
             return jsonify([]), 200
@@ -1539,6 +1795,8 @@ def get_invoices():
             serialized_invoice["uploaded_by_type"] = (
                 "maker" if invoice["vendor_id"] == MAKER_VENDOR_ID else "vendor"
             )
+            # 0 until the submission_round column exists (invoice table change for return/replace).
+            serialized_invoice["submission_round"] = int(serialized_invoice.get("submission_round") or 0)
             serialized_invoice["tax_details"] = tax_details_by_invoice.get(invoice["id"], [])
             serialized_invoice["line_items"] = line_items_by_invoice.get(invoice["id"], [])
             result.append(serialized_invoice)
