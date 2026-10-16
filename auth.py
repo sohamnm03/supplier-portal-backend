@@ -37,6 +37,13 @@ STAGE_APPROVED = "approved"              # checker approved, SAP vendor being cr
 STAGE_ACTIVE = "active"
 STAGE_RETURNED = "returned"              # sent back to the vendor with reasons
 STAGE_REJECTED = "rejected"              # final rejection (legacy / maker-created vendors)
+STAGE_CHANGE_REQUESTED = "change_requested"  # vendor asked to change details; waiting for the reviewer to send it back
+
+
+# vendor.status while the vendor's request to change details is open; the value records whose queue it is in.
+STATUS_CHANGE_REQ_MAKER = "change_req_maker"      # was Pending
+STATUS_CHANGE_REQ_CHECKER = "change_req_checker"  # was 01
+STATUSES_CHANGE_REQUESTED = (STATUS_CHANGE_REQ_MAKER, STATUS_CHANGE_REQ_CHECKER)
 
 
 def stage_for(status, submission_round=0):
@@ -52,6 +59,8 @@ def stage_for(status, submission_round=0):
         return STAGE_APPROVED
     if value in ("01", "sent for approval"):
         return STAGE_CHECKER_REVIEW
+    if value in STATUSES_CHANGE_REQUESTED:
+        return STAGE_CHANGE_REQUESTED
     if value in ("pending", ""):
         return STAGE_MAKER_REVIEW
     return STAGE_REJECTED  # Rejected, Pending Correction, Returned to Vendor, ...

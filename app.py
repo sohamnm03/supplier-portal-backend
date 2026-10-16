@@ -20,6 +20,7 @@ from mysql.connector import Error as MySQLError
 import auth
 import rejections
 import update_requests
+import verification
 from db import get_connection
 
 app = Flask(__name__)
@@ -85,6 +86,7 @@ VENDOR_RESPONSE_FIELDS = [
     "submission_round",
     "submitted_at",
     "returned_at",
+    "correction_fields",
 ]
 
 INVOICE_JSON_FIELDS = {
@@ -516,6 +518,8 @@ def _vendor_with_progress(vendor_id):
     vendor["rejection"] = (
         rejections.get_open_rejection(vendor_id) if vendor["stage"] in (auth.STAGE_RETURNED, auth.STAGE_REJECTED) else None
     )
+    vendor["change_request"] = _change_request_of(vendor) if vendor["stage"] == auth.STAGE_CHANGE_REQUESTED else None
+    vendor.pop("correction_fields", None)
     # The rejecter's name is internal; the vendor only learns whether it was the maker's or checker's review.
     return vendor
 
@@ -698,6 +702,10 @@ def submit_my_application():
         duplicate_error = _find_duplicate_identity({"pan": final.get("pan")}, exclude_vendor_id=vendor_id)
         if duplicate_error:
             return jsonify({"error": duplicate_error}), 409
+        # The real guarantee behind the form's Verify buttons: PAN (and GSTIN / Aadhaar when given) must verify now.
+        verification_error = verification.enforce_on_submit(final)
+        if verification_error:
+            return jsonify({"error": verification_error[0]}), verification_error[1]
 
         _save_onboarding(vendor_id, before, values)
 
@@ -730,6 +738,214 @@ def submit_my_application():
         resubmission=(vendor.get("submission_round") or 0) > 1,
     )
     return jsonify(vendor), 200
+
+
+@app.post("/vendors/verify/<service>")
+@auth.vendor_required(auth.STAGE_DRAFT, auth.STAGE_RETURNED)
+def verify_identity(service):
+    """Verify a PAN, GSTIN or Aadhaar number for the onboarding form (service is pan, gstin or aadhaar).
+
+    Body: {"value": "...", "pan": "...", "gstin": "..."}; pan / gstin are the other tax ids in the form, used to
+    check the PAN belongs to the GSTIN. The raw verification response is never returned.
+    """
+    service = service.upper()
+    if service not in verification.SERVICES:
+        return jsonify({"error": "Unknown verification service"}), 404
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be JSON"}), 400
+    body, status = verification.verify_for_form(service, data.get("value"), pan=data.get("pan"), gstin=data.get("gstin"))
+    return jsonify(body), status
+
+
+# --- Vendor-initiated "request changes" -----------------------------------------------------------------------
+#
+# While the application is with the maker or checker the vendor can ask to change some fields. Status becomes
+# change_req_maker / change_req_checker (the value remembers whose queue it is in), vendor.correction_fields holds the
+# field keys asked for, and that role is emailed. The reviewer then returns the application with the normal "Return for
+# Correction" (status `returned`) or declines the request (the enterprise app restores Pending / 01). The vendor can
+# also cancel while it is waiting. Resubmitting after a return follows the usual Pending -> maker -> checker path.
+
+# The status that marks an open request, by the stage the application was in; and what cancelling restores.
+_REQUEST_FROM_STAGE = {auth.STAGE_MAKER_REVIEW: auth.STATUS_CHANGE_REQ_MAKER, auth.STAGE_CHECKER_REVIEW: auth.STATUS_CHANGE_REQ_CHECKER}
+_CANCEL_TO_STATUS = {auth.STATUS_CHANGE_REQ_MAKER: STATUS_PENDING, auth.STATUS_CHANGE_REQ_CHECKER: "01"}
+_REQUEST_ROLE_GROUP = {auth.STATUS_CHANGE_REQ_MAKER: "MAKER", auth.STATUS_CHANGE_REQ_CHECKER: "CHECKER"}
+MAX_REQUESTED_FIELDS = 30
+# A dedicated template in the shared email service; until it is deployed the closest existing one is used.
+CHANGE_REQUESTED_TEMPLATE = os.getenv("VENDOR_CHANGE_REQUESTED_TEMPLATE", "vendor_registration_submitted")
+
+
+def _field_master(has_gstin):
+    """{field_key: {field_key, field_label, section}} of what a vendor may ask to change (from rejection_reason).
+
+    Fields the GSTIN lookup fills in are left out for a vendor who has a GSTIN, since they cannot edit those."""
+    conn = cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT field_key, field_label, section, locked_by_gstin FROM rejection_reason "
+            "WHERE is_active = 1 AND field_key IS NOT NULL ORDER BY sort_order, reason_id"
+        )
+        rows = cursor.fetchall()
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+    fields = {}
+    for row in rows:
+        if has_gstin and row["locked_by_gstin"]:
+            continue
+        fields.setdefault(row["field_key"], {"field_key": row["field_key"], "field_label": row["field_label"], "section": row["section"]})
+    return fields
+
+
+def _change_request_of(vendor):
+    """What the vendor asked for, for display: the fields (with labels) and whose queue it is waiting in."""
+    keys = [key for key in str(vendor.get("correction_fields") or "").split(",") if key]
+    master = _field_master(False)
+    status = str(vendor.get("status") or "").strip().lower()
+    return {
+        "fields": [{"field_key": key, "field_label": master.get(key, {}).get("field_label") or key} for key in keys],
+        "with_role": "checker" if status == auth.STATUS_CHANGE_REQ_CHECKER else "maker",
+    }
+
+
+def _group_emails(group_code, fallback):
+    """The active members of an email group (Configure Emails screen in the enterprise app), else `fallback`."""
+    conn = cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT m.email_id FROM email_group_members m JOIN email_groups g ON g.group_id = m.group_id "
+            "WHERE g.group_code = %s AND g.is_active = 1 AND m.is_active = 1",
+            (group_code,),
+        )
+        emails = sorted({str(row[0]).strip() for row in cursor.fetchall() if row[0] and str(row[0]).strip()})
+    except MySQLError:
+        emails = []
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+    return emails or [fallback]
+
+
+def _send_change_request_email(vendor, new_status, labels):
+    vendor_name = vendor.get("vendor_legal_name") or vendor.get("name") or vendor.get("email")
+    request_id = f"VR-{vendor['vendor_id']}"
+    subject = f"Vendor asked to change details - {vendor_name}"
+    if CHANGE_REQUESTED_TEMPLATE == "vendor_change_requested":
+        params = {
+            "vendor_name": vendor_name,
+            "vendor_email": vendor.get("email"),
+            "fields": labels,
+            "requested_at": _now_ist_text(),
+            "request_id": request_id,
+            "review_url": FRONTEND_BASE_URL,
+        }
+    else:
+        # The "registration submitted" template has no field list, so the request goes in its "submitted by" line.
+        params = {
+            "vendor_name": vendor_name,
+            "submitted_by": f"{vendor_name} ({vendor.get('email')}) asked to change: {', '.join(labels)}",
+            "submitted_at": _now_ist_text(),
+            "request_id": request_id,
+            "review_url": FRONTEND_BASE_URL,
+        }
+    for recipient in _group_emails(_REQUEST_ROLE_GROUP[new_status], MAKER_EMAIL):
+        _send_email(recipient, subject, CHANGE_REQUESTED_TEMPLATE, params)
+
+
+@app.get("/vendors/me/change-request/fields")
+@auth.vendor_required(auth.STAGE_MAKER_REVIEW, auth.STAGE_CHECKER_REVIEW)
+def change_request_fields():
+    """The form fields a vendor can ask to change."""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT gstin FROM vendor WHERE vendor_id = %s", (g.vendor["vendor_id"],))
+        row = cursor.fetchone() or {}
+    finally:
+        conn.close()
+    fields = _field_master(bool(str(row.get("gstin") or "").strip()))
+    return jsonify({"fields": list(fields.values())}), 200
+
+
+@app.post("/vendors/me/change-request")
+@auth.vendor_required(auth.STAGE_MAKER_REVIEW, auth.STAGE_CHECKER_REVIEW)
+def request_changes():
+    """The vendor asks to change the ticked fields while their application is under review."""
+    data = request.get_json(silent=True)
+    requested = data.get("fields") if isinstance(data, dict) else None
+    if not isinstance(requested, list) or not requested:
+        return jsonify({"error": "Choose at least one field you want to change."}), 400
+    keys = list(dict.fromkeys(str(key).strip() for key in requested if str(key).strip()))
+    if not keys or len(keys) > MAX_REQUESTED_FIELDS:
+        return jsonify({"error": f"Choose between 1 and {MAX_REQUESTED_FIELDS} fields."}), 400
+
+    vendor_id = g.vendor["vendor_id"]
+    new_status = _REQUEST_FROM_STAGE[g.vendor["stage"]]
+    conn = cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT gstin, vendor_legal_name, name, email FROM vendor WHERE vendor_id = %s", (vendor_id,))
+        row = cursor.fetchone() or {}
+        master = _field_master(bool(str(row.get("gstin") or "").strip()))
+        unknown = [key for key in keys if key not in master]
+        if unknown:
+            return jsonify({"error": "One of the chosen fields cannot be changed this way.", "fields": unknown}), 400
+        # Only while the status is still exactly what the stage was read from: a reviewer acting at the same moment wins.
+        cursor.execute(
+            "UPDATE vendor SET status = %s, correction_fields = %s WHERE vendor_id = %s AND status = %s",
+            (new_status, ",".join(keys), vendor_id, g.vendor["status"]),
+        )
+        changed = cursor.rowcount
+        conn.commit()
+    except MySQLError as err:
+        return jsonify({"error": str(err)}), 500
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+    if not changed:
+        return jsonify({"error": "Your application has just moved on, so the request was not sent. Please refresh."}), 409
+
+    _send_change_request_email({**row, "vendor_id": vendor_id}, new_status, [master[key]["field_label"] for key in keys])
+    return jsonify(_vendor_with_progress(vendor_id)), 200
+
+
+@app.post("/vendors/me/change-request/cancel")
+@auth.vendor_required(auth.STAGE_CHANGE_REQUESTED)
+def cancel_change_request():
+    """The vendor withdraws the request: the application goes back to the queue it was in."""
+    vendor_id = g.vendor["vendor_id"]
+    restore = _CANCEL_TO_STATUS[str(g.vendor["status"]).strip().lower()]
+    conn = cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE vendor SET status = %s, correction_fields = NULL WHERE vendor_id = %s AND status = %s",
+            (restore, vendor_id, g.vendor["status"]),
+        )
+        changed = cursor.rowcount
+        conn.commit()
+    except MySQLError as err:
+        return jsonify({"error": str(err)}), 500
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+    if not changed:
+        return jsonify({"error": "Your request has just been handled by our team. Please refresh."}), 409
+    return jsonify(_vendor_with_progress(vendor_id)), 200
 
 
 @app.post("/vendors")
@@ -881,7 +1097,7 @@ def upload_vendor_documents(vendor_id):
 
 
 @app.get("/vendors/me/documents")
-@auth.vendor_required(auth.STAGE_DRAFT, auth.STAGE_RETURNED)
+@auth.vendor_required()
 def list_my_documents():
     """The supporting documents already on file, so the form can show them and offer to replace them."""
     vendor_id = g.vendor["vendor_id"]

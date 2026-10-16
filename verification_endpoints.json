@@ -1,0 +1,5 @@
+{
+  "PAN": "https://fs-tpi-api-b3ach3amhza3amea.centralindia-01.azurewebsites.net/api/pan/verify",
+  "GSTIN": "https://fs-tpi-api-b3ach3amhza3amea.centralindia-01.azurewebsites.net/api/gstin/verify",
+  "AADHAAR": "https://fs-tpi-api-b3ach3amhza3amea.centralindia-01.azurewebsites.net/api/aadhaar/verify"
+}
