@@ -4,6 +4,8 @@ Until now the portal trusted whatever `vendor_id` the browser sent. A signed tok
 vendor who logged in, and the guard also enforces which stage of the lifecycle may use an endpoint:
 
   registered / returned -> may fill in and submit the onboarding form
+  agreement             -> may read and sign (or decline) the vendor agreement
+  agreement_signed      -> waits for the checker's final approval (read-only)
   active                -> may use invoices and profile change requests
 """
 import logging
@@ -38,6 +40,12 @@ STAGE_ACTIVE = "active"
 STAGE_RETURNED = "returned"              # sent back to the vendor with reasons
 STAGE_REJECTED = "rejected"              # final rejection (legacy / maker-created vendors)
 STAGE_CHANGE_REQUESTED = "change_requested"  # vendor asked to change details; waiting for the reviewer to send it back
+STAGE_AGREEMENT = "agreement"                # checker issued the vendor agreement; the vendor must review and sign it
+STAGE_AGREEMENT_SIGNED = "agreement_signed"  # vendor signed; waiting for the checker's final approval
+
+# vendor.status while the vendor agreement is out for signature / signed (onboarding only; a renewal never changes the status).
+STATUS_AGREEMENT_SENT = "agreement_sent"
+STATUS_AGREEMENT_SIGNED = "agreement_signed"
 
 
 # vendor.status while the vendor's request to change details is open; the value records whose queue it is in.
@@ -61,6 +69,10 @@ def stage_for(status, submission_round=0):
         return STAGE_CHECKER_REVIEW
     if value in STATUSES_CHANGE_REQUESTED:
         return STAGE_CHANGE_REQUESTED
+    if value == STATUS_AGREEMENT_SENT:
+        return STAGE_AGREEMENT
+    if value == STATUS_AGREEMENT_SIGNED:
+        return STAGE_AGREEMENT_SIGNED
     if value in ("pending", ""):
         return STAGE_MAKER_REVIEW
     return STAGE_REJECTED  # Rejected, Pending Correction, Returned to Vendor, ...

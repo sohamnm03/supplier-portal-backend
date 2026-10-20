@@ -17,6 +17,7 @@ from flask import Flask, g, jsonify, request
 from flask_cors import CORS
 from mysql.connector import Error as MySQLError
 
+import agreements
 import auth
 import rejections
 import update_requests
@@ -520,6 +521,10 @@ def _vendor_with_progress(vendor_id):
     )
     vendor["change_request"] = _change_request_of(vendor) if vendor["stage"] == auth.STAGE_CHANGE_REQUESTED else None
     vendor.pop("correction_fields", None)
+    # The agreement waiting for the vendor's signature (onboarding or a renewal), if any.
+    vendor["agreement"] = agreements.open_agreement_summary(vendor_id, vendor["stage"])
+    # When the vendor's newest agreement was declined (the application is back with the checker), say so.
+    vendor["declined_agreement"] = agreements.declined_agreement_summary(vendor_id)
     # The rejecter's name is internal; the vendor only learns whether it was the maker's or checker's review.
     return vendor
 
@@ -1368,6 +1373,72 @@ def login_vendor():
         if conn is not None:
             conn.close()
 
+_PASSWORD_MIN_LENGTH = 8
+_PASSWORD_MAX_LENGTH = 64
+_PASSWORD_CHANGE_STAGES = (
+    auth.STAGE_DRAFT, auth.STAGE_RETURNED, auth.STAGE_MAKER_REVIEW, auth.STAGE_CHECKER_REVIEW,
+    auth.STAGE_AGREEMENT, auth.STAGE_AGREEMENT_SIGNED, auth.STAGE_APPROVED, auth.STAGE_CHANGE_REQUESTED,
+    auth.STAGE_ACTIVE,
+)
+
+
+@app.post("/vendors/me/password")
+@auth.vendor_required(*_PASSWORD_CHANGE_STAGES)
+def change_vendor_password():
+    """A signed-in vendor (any stage except rejected) chooses their own password, e.g. instead of the emailed one."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be JSON"}), 400
+    current = data.get("current_password")
+    new = data.get("new_password")
+    if not isinstance(current, str) or not current:
+        return jsonify({"error": "current_password is required"}), 400
+    if not isinstance(new, str) or not new:
+        return jsonify({"error": "new_password is required"}), 400
+    if len(new) < _PASSWORD_MIN_LENGTH or len(new) > _PASSWORD_MAX_LENGTH:
+        return jsonify({"error": f"The new password must be {_PASSWORD_MIN_LENGTH} to {_PASSWORD_MAX_LENGTH} characters."}), 400
+    if new == current:
+        return jsonify({"error": "The new password must be different from the current one."}), 400
+
+    vendor_id = g.vendor["vendor_id"]
+    email = g.vendor["email"]
+    # The same throttle as the login: a stolen session must not be able to guess the current password.
+    wait = auth.login_blocked_for(email)
+    if wait:
+        response = jsonify({"error": "Too many failed attempts. Please try again in a few minutes."})
+        response.status_code = 429
+        response.headers["Retry-After"] = str(wait)
+        return response
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT password FROM vendor WHERE vendor_id = %s", (vendor_id,))
+        row = cursor.fetchone()
+        stored_hash = row.get("password") if row else None
+        submitted_hash = hashlib.sha256(current.encode("utf-8")).hexdigest()
+        if not stored_hash or not hmac.compare_digest(str(stored_hash), submitted_hash):
+            auth.record_login_failure(email)
+            return jsonify({"error": "Current password is incorrect"}), 403
+
+        auth.clear_login_failures(email)
+        cursor.execute(
+            "UPDATE vendor SET password = %s WHERE vendor_id = %s",
+            (hashlib.sha256(new.encode("utf-8")).hexdigest(), vendor_id),
+        )
+        conn.commit()
+        return jsonify({"message": "Your password has been changed."}), 200
+    except MySQLError as err:
+        return jsonify({"error": str(err)}), 500
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+
+
 @app.post("/vendors/check-pan")
 def check_vendor_pan():
     data = request.get_json(silent=True) or {}
@@ -1934,6 +2005,61 @@ def replace_invoice(invoice_id):
     ), 200
 
 
+# The columns of an invoice the details view shows. The preview of a new file returns just these, in the shape GET /invoices uses.
+_PREVIEW_INVOICE_COLUMNS = (
+    "invoice_number", "invoice_date", "due_date", "payment_term", "purchase_order", "currency",
+    "subtotal", "taxable_total", "total_tax", "total_amount",
+    "vendor_name", "extracted_vendor_name", "vendor_tax_id", "vendor_address",
+    "customer_name", "customer_tax_id", "billing_address", "shipping_address",
+    "vendor_gstin_verified", "customer_gstin_verified",
+)
+_PREVIEW_TAX_COLUMNS = ("tax_type", "tax_description", "tax_rate", "tax_amount")
+_PREVIEW_LINE_COLUMNS = (
+    "line_number", "product_code", "description", "item_date", "quantity", "unit", "unit_price",
+    "taxable_amount", "tax_amount", "total_amount",
+)
+
+
+@app.post("/invoices/<int:invoice_id>/replace-preview")
+@auth.vendor_required(auth.STAGE_ACTIVE)
+def preview_replacement_invoice(invoice_id):
+    """Read a new file with the OCR service and return its details, so the vendor can compare them with the invoice
+    being replaced before overwriting it. Nothing is saved: the invoice and its rows are untouched."""
+    invoice_file = request.files.get("invoices")
+    if invoice_file is None or not invoice_file.filename:
+        return jsonify({"error": "invoices file is required"}), 400
+    file_bytes = invoice_file.read()
+    if not file_bytes:
+        return jsonify({"error": "invoices file must not be empty"}), 400
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        if _owned_invoice_id(cursor, invoice_id) is None:
+            return jsonify({"error": "Invoice not found"}), 404
+        cursor.execute("SELECT status FROM invoices WHERE id = %s", (invoice_id,))
+        if (cursor.fetchone() or {}).get("status") != "Returned to Vendor":
+            return jsonify({"error": "This invoice has not been returned to you, so it cannot be replaced."}), 409
+    except MySQLError as err:
+        return jsonify({"error": str(err)}), 500
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+
+    parsed, ocr_error = _extract_invoice_from_ocr(invoice_file, file_bytes, str(g.vendor["vendor_id"]))
+    if ocr_error is not None:
+        return jsonify(ocr_error[0]), ocr_error[1]
+
+    invoice = _serialize_row({column: parsed["invoice_values"].get(column) for column in _PREVIEW_INVOICE_COLUMNS})
+    invoice["tax_details"] = [_serialize_row(dict(zip(_PREVIEW_TAX_COLUMNS, row))) for row in parsed["tax_rows"]]
+    invoice["line_items"] = [_serialize_row(dict(zip(_PREVIEW_LINE_COLUMNS, row))) for row in parsed["line_rows"]]
+    return jsonify({"invoice": invoice}), 200
+
+
 @app.get("/invoices")
 @auth.vendor_required(auth.STAGE_ACTIVE)
 def get_invoices():
@@ -2025,6 +2151,20 @@ def get_invoices():
             conn.close()
 
     return jsonify(result), 200
+
+
+# Vendor agreement signing (vendor side). The shared helpers above are handed over so agreements.py needs no import of app.
+agreements.configure(
+    send_email=lambda *args, **kwargs: _send_email(*args, **kwargs),
+    group_emails=lambda *args, **kwargs: _group_emails(*args, **kwargs),
+    email_verification_request=lambda *args, **kwargs: _email_verification_request(*args, **kwargs),
+    verified_email_error=lambda *args, **kwargs: _verified_email_error(*args, **kwargs),
+    docs_container=lambda: _docs_container(),
+    frontend_url=FRONTEND_BASE_URL,
+    maker_email=MAKER_EMAIL,
+    support_email=SUPPORT_EMAIL,
+)
+app.register_blueprint(agreements.bp)
 
 
 if __name__ == "__main__":

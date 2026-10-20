@@ -4,3 +4,5 @@ mysql-connector-python==9.0.0
 python-dotenv==1.0.1
 requests>=2.32.0,<3.0.0
 azure-storage-blob>=12.19,<13
+reportlab==5.0.1
+pillow==13.0.0

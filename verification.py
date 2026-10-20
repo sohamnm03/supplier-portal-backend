@@ -82,22 +82,28 @@ def _name_key(value):
     return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
 
 
-def _pan_of_gstin(gstin_data, gstin):
-    return str(gstin_data.get("pan_number") or gstin[2:12]).strip().upper()
+def _pan_of_gstin(gstin):
+    """The PAN written inside a GSTIN (characters 3-12). By how GSTINs are issued this is the holder's PAN, so it is what we trust; the
+    provider's own pan_number field is not used because a record's copy can disagree with the GSTIN itself."""
+    return gstin[2:12]
+
+
+PAN_MISMATCH_MESSAGE = "This PAN does not match the GSTIN. The PAN inside GSTIN {gstin} is {embedded}."
+NAME_MISMATCH_MESSAGE = "The name on this PAN's record does not match the name registered for the GSTIN."
 
 
 def check_pan_belongs_to_gstin(pan, gstin, gstin_data, pan_data=None):
     """Return an error message unless `pan` is the PAN this GSTIN is registered under, else None.
 
-    A company has many GSTINs but one PAN, so the PAN inside the GSTIN (characters 3-12) must be the PAN given,
-    and when both services name the registered holder those names must agree.
+    A company has many GSTINs but one PAN, so the PAN inside the GSTIN must be the PAN given, and when both services name the
+    registered holder those names must agree.
     """
-    if _pan_of_gstin(gstin_data, gstin) != pan or gstin[2:12] != pan:
-        return "This PAN is not linked to this GSTIN."
+    if _pan_of_gstin(gstin) != pan:
+        return PAN_MISMATCH_MESSAGE.format(gstin=gstin, embedded=_pan_of_gstin(gstin))
     if pan_data:
         gst_name, pan_name = _name_key(gstin_data.get("name")), _name_key(pan_data.get("name"))
         if gst_name and pan_name and gst_name != pan_name:
-            return "This PAN is not linked to this GSTIN: the registered names do not match."
+            return NAME_MISMATCH_MESSAGE
     return None
 
 
@@ -139,19 +145,23 @@ def verify_for_form(service, value, pan=None, gstin=None):
 
 
 def _verified_gstin(gstin, data):
-    """A verified GSTIN brings its own PAN (the business PAN it is registered under), which replaces whatever PAN was typed."""
-    pan = _pan_of_gstin(data, gstin)
+    """A verified (active) GSTIN fills in its details and the PAN written inside it. The GSTIN is verified on its own merits: whether
+    that PAN can ALSO be verified is reported separately (pan_verified, and pan_message for the PAN field), never as a GSTIN error."""
+    pan = _pan_of_gstin(gstin)
+    pan_message = ""
+    pan_verified = False
     try:
         pan_outcome = call("PAN", pan) if PAN_RE.match(pan) else None
+        if pan_outcome is None:
+            pan_message = f"The PAN inside this GSTIN ({pan}) is not a valid PAN."
+        elif not pan_outcome["verified"]:
+            pan_message = f"PAN {pan} (from your GSTIN) was not found in the PAN records."
+        else:
+            error = check_pan_belongs_to_gstin(pan, gstin, data, pan_outcome["data"])
+            pan_verified = error is None
+            pan_message = error or ""
     except VerificationUnavailable:
-        pan_outcome = None  # the PAN has its own Verify; do not fail the GSTIN for it
-
-    pan_verified = bool(pan_outcome and pan_outcome["verified"])
-    if pan_verified:
-        # The PAN holder and the GSTIN holder must be the same registered name.
-        error = check_pan_belongs_to_gstin(pan, gstin, data, pan_outcome["data"])
-        if error:
-            return _result(False, error)
+        pan_message = "PAN verification is unavailable right now. Please press Verify on the PAN in a moment."
 
     fill = {
         "vendor_legal_name": str(data.get("trade_name") or data.get("name") or "").strip(),
@@ -160,7 +170,7 @@ def _verified_gstin(gstin, data):
         "postal_code": str(data.get("pincode") or "").strip(),
         "pan": pan,
     }
-    return _result(True, "GSTIN verified.", fill=fill, pan_verified=pan_verified)
+    return _result(True, "GSTIN verified.", fill=fill, pan_verified=pan_verified, pan_message=pan_message)
 
 
 def enforce_on_submit(values):
