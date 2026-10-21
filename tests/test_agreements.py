@@ -98,7 +98,7 @@ def test_me_includes_open_agreement(env, monkeypatch):
 
 def test_pdf_first_view_and_download(env):
     env.state.add_agreement(1, 1, "sent")
-    env.container.blobs["agreements/vendor_7/AGR-2026-00001.pdf"] = b"%PDF-unsigned"
+    env.container.blobs["vendor_7/AGR-2026-00001.pdf"] = b"%PDF-unsigned"
     env.db.commit_now()
     r = env.client.get("/vendors/me/agreements/1/pdf", headers=env.headers)
     assert r.status_code == 200 and r.data == b"%PDF-unsigned" and r.mimetype == "application/pdf"
@@ -120,10 +120,10 @@ def test_pdf_other_vendors_agreement_404(env):
 
 def test_pdf_declined_hidden_and_signed_copy_served(env):
     env.state.add_agreement(1, 1, "declined")
-    env.state.add_agreement(2, 2, "signed", signed_pdf_path="agreements/vendor_7/AGR-2026-00002_signed.pdf")
-    env.container.blobs["agreements/vendor_7/AGR-2026-00002_signed.pdf"] = b"%PDF-signed"
+    env.state.add_agreement(2, 2, "signed", signed_pdf_path="vendor_7/AGR-2026-00002_signed.pdf")
+    env.container.blobs["vendor_7/AGR-2026-00002_signed.pdf"] = b"%PDF-signed"
     env.db.commit_now()
-    env.container.blobs["agreements/vendor_7/AGR-2026-00001.pdf"] = b"%PDF-unsigned"
+    env.container.blobs["vendor_7/AGR-2026-00001.pdf"] = b"%PDF-unsigned"
     assert env.client.get("/vendors/me/agreements/1/pdf", headers=env.headers).data == b"%PDF-unsigned"  # a declined one is kept as issued
     assert env.client.get("/vendors/me/agreements/2/pdf", headers=env.headers).data == b"%PDF-signed"
 
@@ -195,7 +195,7 @@ def test_sign_onboarding_happy_path(env, monkeypatch):
     assert r.get_json()["stage"] == "agreement_signed"
     row = env.state.agreements[1]
     assert row["status"] == "signed" and row["signer_name"] == "Vee Vendor" and row["signature_method"] == "draw"
-    assert row["signed_pdf_path"] == "agreements/vendor_7/AGR-2026-00001_signed.pdf"
+    assert row["signed_pdf_path"] == "vendor_7/AGR-2026-00001_signed.pdf"
     assert row["vendor_id"] == 7
     assert env.state.vendors[7]["status"] == "agreement_signed"
     assert env.container.uploads == [row["signed_pdf_path"]]  # uploaded once
@@ -316,7 +316,7 @@ def test_sign_withdrawn_during_signing_discards_upload(env, monkeypatch):
     r = env.client.post("/vendors/me/agreements/1/sign", headers=env.headers, json=env.sign_body())
     assert r.status_code == 409 and "withdrawn" in r.get_json()["error"]
     assert env.state.vendors[7]["status"] == "agreement_sent"
-    assert env.container.deleted == ["agreements/vendor_7/AGR-2026-00001_signed.pdf"]
+    assert env.container.deleted == ["vendor_7/AGR-2026-00001_signed.pdf"]
 
 
 def test_sign_expired_is_410(env):

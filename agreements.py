@@ -9,7 +9,6 @@ import base64
 import binascii
 import hmac
 import json
-from pathlib import Path
 import logging
 import os
 import re
@@ -49,46 +48,9 @@ HISTORY_STAGES = VIEW_STAGES + (auth.STAGE_CHECKER_REVIEW, auth.STAGE_MAKER_REVI
 deps = {}
 
 
-class _LocalContainer:
-    """The few container calls this module makes, backed by a folder on local disk. Only used when Azure Blob Storage is not configured and
-    AGREEMENT_LOCAL_DIR is set (a demo / development setup where both backends share one folder)."""
-
-    def __init__(self, base):
-        self.base = Path(base).resolve()
-
-    def _path(self, name):
-        target = (self.base / name).resolve()
-        if target != self.base and self.base not in target.parents:
-            raise ValueError("Invalid agreement file path.")
-        return target
-
-    def upload_blob(self, name, data, overwrite=True, content_settings=None):
-        path = self._path(name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
-
-    def delete_blob(self, name):
-        self._path(name).unlink(missing_ok=True)
-
-    def get_blob_client(self, name):
-        path = self._path(name)
-
-        class _Reader:
-            def download_blob(self_inner):
-                class _Data:
-                    def readall(self_data):
-                        return path.read_bytes()
-                return _Data()
-
-        return _Reader()
-
-
 def _storage():
-    """The blob container for agreement files, the local-disk stand-in when Azure is not configured, or None."""
-    container = deps["docs_container"]()
-    if container is None and os.getenv("AGREEMENT_LOCAL_DIR"):
-        return _LocalContainer(os.environ["AGREEMENT_LOCAL_DIR"])
-    return container
+    """The blob container for agreement files, or None when Azure storage is not configured."""
+    return deps["docs_container"]()
 
 
 
@@ -747,7 +709,7 @@ def sign_agreement(agreement_id):
             container = _storage()
             if container is None:
                 return _err("Document storage is not configured. Please try again later.", 503)
-            blob_path = f"agreements/vendor_{vendor_id}/{row['agreement_no']}_signed.pdf"
+            blob_path = f"vendor_{vendor_id}/{row['agreement_no']}_signed.pdf"
             try:
                 container.upload_blob(blob_path, pdf, overwrite=True,
                                       content_settings=ContentSettings(content_type="application/pdf"))
