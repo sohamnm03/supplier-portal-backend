@@ -29,8 +29,13 @@ def test_agreement_routes_need_token(env):
 
 
 def test_other_stage_cannot_use_agreements(env):
-    env.state.vendors[7]["status"] = "01"
+    env.state.vendors[7]["status"] = "Rejected"
     assert env.client.get("/vendors/me/agreements", headers=env.headers).status_code == 403
+    # the history stays readable while the application is with the reviewers again, but nothing can be signed from there
+    env.state.vendors[7]["status"] = "01"
+    env.db.commit_now()
+    assert env.client.get("/vendors/me/agreements", headers=env.headers).status_code == 200
+    assert env.client.post("/vendors/me/agreements/1/send-code", headers=env.headers).status_code == 403
 
 
 # --- list --------------------------------------------------------------------------------------------------
@@ -46,7 +51,9 @@ def test_list_states_and_order(env):
     s.add_agreement(6, 6, "withdrawn")
     env.db.commit_now()
     items = env.client.get("/vendors/me/agreements", headers=env.headers).get_json()
-    assert [i["agreement_id"] for i in items] == [4, 3, 2, 1]  # newest first, no declined / withdrawn
+    assert [i["agreement_id"] for i in items] == [5, 4, 3, 2, 1]  # newest first; the declined one is kept for the record, a withdrawn one is not
+    declined = next(i for i in items if i["agreement_id"] == 5)
+    assert declined["derived_state"] == "declined" and not declined["can_sign"] and not declined["is_current"] and not declined["has_signed_pdf"]
     by_id = {i["agreement_id"]: i for i in items}
     assert by_id[4]["derived_state"] == "awaiting" and by_id[4]["can_sign"] and not by_id[4]["is_current"]
     assert by_id[3]["derived_state"] == "active" and by_id[3]["is_current"] and not by_id[3]["can_sign"]
@@ -116,7 +123,8 @@ def test_pdf_declined_hidden_and_signed_copy_served(env):
     env.state.add_agreement(2, 2, "signed", signed_pdf_path="agreements/vendor_7/AGR-2026-00002_signed.pdf")
     env.container.blobs["agreements/vendor_7/AGR-2026-00002_signed.pdf"] = b"%PDF-signed"
     env.db.commit_now()
-    assert env.client.get("/vendors/me/agreements/1/pdf", headers=env.headers).status_code == 404
+    env.container.blobs["agreements/vendor_7/AGR-2026-00001.pdf"] = b"%PDF-unsigned"
+    assert env.client.get("/vendors/me/agreements/1/pdf", headers=env.headers).data == b"%PDF-unsigned"  # a declined one is kept as issued
     assert env.client.get("/vendors/me/agreements/2/pdf", headers=env.headers).data == b"%PDF-signed"
 
 
@@ -358,9 +366,9 @@ def test_decline_onboarding_restores_01(env, monkeypatch):
     assert env.state.events[-1]["event_type"] == "declined" and env.state.events[-1]["detail"] == {"reason": "Terms not acceptable", "at_step": "sign"}
     assert sorted(m[0] for m in env.emails) == ["checker1@acme.test", "checker2@acme.test"]
     assert env.emails[0][3]["reason"] == "Terms not acceptable"
-    # declined agreements disappear from the vendor's list
-    env.headers = {"Authorization": "Bearer " + auth.issue_token(7, "v@vendor.test")}
-    assert env.client.get("/vendors/me/agreements", headers=env.headers).status_code == 403  # now in checker_review
+    # the declined agreement stays in the vendor's history, with the reason and where it was declined
+    items = env.client.get("/vendors/me/agreements", headers=env.headers).get_json()  # now in checker_review
+    assert [(i["agreement_id"], i["derived_state"], i["decline_reason"], i["decline_step"]) for i in items] == [(1, "declined", "Terms not acceptable", "sign")]
 
 
 def test_decline_renewal_changes_nothing_else(env):
@@ -473,9 +481,28 @@ def test_decline_stores_step_and_rejects_bad_step(env):
     env.db.commit_now()
     bad = env.client.post("/vendors/me/agreements/1/decline", headers=env.headers, json={"reason": "wrong data", "at_step": "x"})
     assert bad.status_code == 400
-    ok = env.client.post("/vendors/me/agreements/1/decline", headers=env.headers, json={"reason": "wrong data", "at_step": "review"})
-    assert ok.status_code == 200
-    assert env.state.events[-1]["detail"] == {"reason": "wrong data", "at_step": "review"}
+    ok = env.client.post("/vendors/me/agreements/1/decline", headers=env.headers, json={"reason": "wrong data", "at_step": "sign"})
+    assert ok.status_code == 200 and ok.get_json()["stage"] == "checker_review"
+    assert env.state.events[-1]["detail"] == {"reason": "wrong data", "at_step": "sign"}
+    assert env.state.vendors[7]["status"] == "01"
+
+
+def test_decline_at_review_is_a_change_request(env):
+    env.state.vendors[7]["status"] = "agreement_sent"; env.state.events.clear(); env.db.commit_now()
+    env.state.add_agreement(1, 1, "sent")
+    env.db.commit_now()
+    post = lambda **body: env.client.post("/vendors/me/agreements/1/decline", headers=env.headers, json={"reason": "wrong data", "at_step": "review", **body})
+    assert post().status_code == 400                          # the details to change are required
+    assert post(fields=["nope"]).status_code == 400           # and must be changeable ones
+    assert env.state.agreements[1]["status"] == "sent" and env.state.vendors[7]["status"] == "agreement_sent"
+    assert post(reason="", fields=["pan"]).status_code == 200 and env.state.agreements[1]["decline_reason"] == "Details need to be corrected."
+    env.state.agreements[1].update(status="sent", declined_at=None, decline_reason=None); env.state.vendors[7]["status"] = "agreement_sent"; env.state.events.clear(); env.db.commit_now()
+    ok = post(fields=["pan", "ifsc", "pan"])
+    assert ok.status_code == 200 and ok.get_json()["stage"] == "change_requested"
+    assert env.state.vendors[7]["status"] == "change_req_checker" and env.state.vendors[7]["correction_fields"] == "pan,ifsc"
+    assert env.state.agreements[1]["status"] == "declined"
+    assert env.state.events[-1]["detail"] == {"reason": "wrong data", "at_step": "review", "fields": ["pan", "ifsc"]}
+    assert env.change_emails[-1] == ("change_req_checker", ["PAN", "IFSC"])
 
 
 def test_update_info_with_and_without_detail_changes(env):
@@ -583,3 +610,30 @@ def test_update_info_missing_old_snapshot_falls_back(env):
     info = env.client.get("/vendors/me/agreements", headers=env.headers).get_json()[0]["update_info"]
     assert info["snapshot_missing"] is True
     assert info["changed_keys"] == ["pan"]  # bank name could not be compared
+
+
+# --- live preview -------------------------------------------------------------------------------------------
+
+def test_preview_builds_pdf_and_records_nothing(env):
+    env.state.add_agreement(1, 1, "sent")
+    env.db.commit_now()
+    body = env.sign_body(final=False)
+    r = env.client.post("/vendors/me/agreements/1/preview", headers=env.headers, json=body)
+    assert r.status_code == 200 and r.mimetype == "application/pdf" and r.data.startswith(b"%PDF")
+    final = env.client.post("/vendors/me/agreements/1/preview", headers=env.headers, json={**body, "final": True})
+    assert final.status_code == 200 and final.data.startswith(b"%PDF")
+    # nothing is saved: no upload, still open, no events, no code used
+    assert env.container.uploads == [] and env.state.agreements[1]["status"] == "sent" and env.state.events == []
+    # a name alone (no signature yet) is fine too
+    assert env.client.post("/vendors/me/agreements/1/preview", headers=env.headers, json={"signer_name": "Vee"}).status_code == 200
+
+
+def test_preview_refusals(env):
+    env.state.add_agreement(1, 1, "sent")
+    env.state.add_agreement(2, 2, "signed", signed_pdf_path="p")
+    env.db.commit_now()
+    post = lambda agreement_id, **body: env.client.post(f"/vendors/me/agreements/{agreement_id}/preview", headers=env.headers, json=body)
+    assert post(1, signature="not a data url").status_code == 400
+    assert post(2).status_code == 404  # only an open agreement can be previewed
+    assert post(99).status_code == 404
+    assert env.client.post("/vendors/me/agreements/1/preview", json={}).status_code == 401

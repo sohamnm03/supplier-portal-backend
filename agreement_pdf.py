@@ -243,12 +243,13 @@ def _bold_dates(body_xml, terms):
     return body_xml
 
 
-def build_agreement_pdf(terms, company_signature_png=None, vendor_signature_png=None, certificate=None, document_sha256=None, verify_url=None):
+def build_agreement_pdf(terms, company_signature_png=None, vendor_signature_png=None, certificate=None, document_sha256=None, verify_url=None, preview_signer=None):
     """The agreement as PDF bytes.
 
     Unsigned (no vendor_signature_png): the vendor's signature area is blank. Signed: the vendor's signature is placed in it and, when
     `certificate` is given, a signing certificate page follows (`document_sha256` is the fingerprint of the unsigned agreement).
     certificate keys: signer_name, signer_designation, method_label, signed_at_text, ip, user_agent, otp_text, confirmed_text.
+    preview_signer (the vendor's live preview before signing; no certificate page): {"name", "designation", "signed_line"} fills the vendor block.
     """
     styles = _styles()
     company, vendor = terms["company"], terms["vendor"]
@@ -287,6 +288,9 @@ def build_agreement_pdf(terms, company_signature_png=None, vendor_signature_png=
     if vendor_signature_png and certificate:
         vendor_name, vendor_designation = certificate.get("signer_name", ""), certificate.get("signer_designation", "")
         signed_line = f"Signed electronically on {certificate.get('signed_at_text', '')}"
+    elif preview_signer:
+        vendor_name, vendor_designation = preview_signer.get("name", ""), preview_signer.get("designation", "")
+        signed_line = preview_signer.get("signed_line") if vendor_signature_png else None
     block = _signing_block(company, vendor, terms, company_signature_png, vendor_signature_png, vendor_name, vendor_designation, signed_line, styles)
     story += [Spacer(1, 6), KeepTogether([Paragraph("<b>Signed by the Parties on the date first written above.</b>", styles["base"]), Spacer(1, 8), block])]
 

@@ -97,12 +97,14 @@ class FakeCursor:
         if s.startswith("SELECT vendor_id, email, status, submission_round FROM vendor"):
             v = st.vendors.get(p[0])
             self._rows = [dict(v)] if v else []
+        elif s.startswith("SELECT gstin FROM vendor"):
+            self._rows = [{"gstin": st.vendors[p[0]].get("gstin")}]
         elif s.startswith("SELECT vendor_legal_name, name, email FROM vendor"):
             self._rows = [dict(st.vendors[p[0]])]
         elif s == "SELECT NOW() AS db_now":
             self._rows = [{"db_now": st.now}]
         elif "FROM vendor_agreement WHERE vendor_id = %s AND status IN" in s:
-            rows = [r for r in st.agreements.values() if r["vendor_id"] == p[0] and r["status"] in ("sent", "signed")]
+            rows = [r for r in st.agreements.values() if r["vendor_id"] == p[0] and r["status"] in ("sent", "signed", "declined")]
             rows.sort(key=lambda r: -r["version"])
             self._rows = [{**r, "start_iso": json.loads(r["terms_json"])["start_iso"],
                            "end_iso": json.loads(r["terms_json"])["end_iso"],
@@ -167,6 +169,12 @@ class FakeCursor:
             r = st.agreements[aid]
             if r["vendor_id"] == vid and r["status"] == "sent" and (r["expires_at"] is None or r["expires_at"] >= st.now):
                 r.update(status="declined", declined_at=st.now, decline_reason=reason)
+                self.rowcount = 1
+        elif s.startswith("UPDATE vendor SET status = %s, correction_fields"):
+            new, keys, vid, old = p
+            v = st.vendors[vid]
+            if v["status"] == old:
+                v.update(status=new, correction_fields=keys)
                 self.rowcount = 1
         elif s.startswith("UPDATE vendor SET status"):
             new, vid, old = ("01", p[0], p[1]) if "'01'" in s else p
@@ -268,6 +276,9 @@ def env(monkeypatch):
     monkeypatch.setitem(agreements.deps, "docs_container", lambda: e.container)
     monkeypatch.setitem(agreements.deps, "send_email",
                         lambda to, subject, template, params: e.emails.append((to, subject, template, params)) or True)
+    e.change_emails = []
+    monkeypatch.setitem(agreements.deps, "field_master", lambda has_gstin: {"pan": {"field_key": "pan", "field_label": "PAN"}, "ifsc": {"field_key": "ifsc", "field_label": "IFSC"}})
+    monkeypatch.setitem(agreements.deps, "change_request_email", lambda vendor, status, labels: e.change_emails.append((status, labels)))
     monkeypatch.setitem(agreements.deps, "group_emails", lambda code, fallback: ["checker1@acme.test", "checker2@acme.test"])
     for name in ("VENDOR_AGREEMENT_SIGNED_TEMPLATE", "VENDOR_AGREEMENT_SIGNED_NOTICE_TEMPLATE",
                  "VENDOR_AGREEMENT_DECLINED_TEMPLATE"):

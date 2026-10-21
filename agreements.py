@@ -40,6 +40,9 @@ _DATA_URL = re.compile(r"^data:image/(?:png|jpeg|jpg);base64,([A-Za-z0-9+/=\s]+)
 
 # Stages that may see the Agreement screen; the actions also include agreement_signed so a double click gets a clear 409.
 VIEW_STAGES = (auth.STAGE_AGREEMENT, auth.STAGE_AGREEMENT_SIGNED, auth.STAGE_ACTIVE)
+# The list and the PDF (the vendor's record of every agreement, declined ones included) are open in every stage an agreement can exist in,
+# also while the application is back with the reviewers after a decline or a change request. Signing and declining stay on VIEW_STAGES.
+HISTORY_STAGES = VIEW_STAGES + (auth.STAGE_CHECKER_REVIEW, auth.STAGE_MAKER_REVIEW, auth.STAGE_CHANGE_REQUESTED, auth.STAGE_RETURNED)
 
 # Filled in by app.py: send_email, group_emails, email_verification_request, verified_email_error, docs_container,
 # frontend_url, maker_email, support_email.
@@ -156,7 +159,7 @@ class _Db:
 # --- reading ------------------------------------------------------------------------------------------------
 
 _LIST_COLUMNS = (
-    "agreement_id, agreement_no, version, status, issued_at, expires_at, first_viewed_at, signed_at, signer_name, "
+    "agreement_id, agreement_no, version, status, issued_at, expires_at, first_viewed_at, signed_at, signer_name, declined_at, decline_reason, "
     "signed_pdf_path, JSON_UNQUOTE(JSON_EXTRACT(terms_json, '$.start_iso')) AS start_iso, "
     "JSON_UNQUOTE(JSON_EXTRACT(terms_json, '$.end_iso')) AS end_iso, "
     "JSON_EXTRACT(terms_json, '$.terms') AS key_terms_json, "
@@ -211,6 +214,8 @@ def summarise(rows, now, can_act):
         start = _end_date(r.get("start_iso"))
         if r["status"] == "sent":
             state = "awaiting"
+        elif r["status"] == "declined":
+            state = "declined"
         elif start is not None and start > today:
             state = "scheduled"
         elif any(version > r["version"] for version in started_signed):
@@ -226,6 +231,9 @@ def summarise(rows, now, can_act):
             "issued_at": _iso(r.get("issued_at")),
             "signed_at": _iso(r.get("signed_at")),
             "signer_name": r.get("signer_name"),
+            "declined_at": _iso(r.get("declined_at")),
+            "decline_reason": _text(r.get("decline_reason")) if r["status"] == "declined" else "",
+            "decline_step": "",
             "start_iso": r.get("start_iso"),
             "end_iso": r.get("end_iso"),
             "expires_at": _iso(r.get("expires_at")),
@@ -368,7 +376,7 @@ def declined_agreement_summary(vendor_id):
 
 def _vendor_agreements(cursor, vendor_id, stage):
     cursor.execute(
-        f"SELECT {_LIST_COLUMNS} FROM vendor_agreement WHERE vendor_id = %s AND status IN ('sent', 'signed') "
+        f"SELECT {_LIST_COLUMNS} FROM vendor_agreement WHERE vendor_id = %s AND status IN ('sent', 'signed', 'declined') "
         "ORDER BY version DESC",
         (vendor_id,),
     )
@@ -376,6 +384,9 @@ def _vendor_agreements(cursor, vendor_id, stage):
     cursor.execute("SELECT NOW() AS db_now")
     now = cursor.fetchone()["db_now"]
     items = summarise(rows, now, stage in (auth.STAGE_AGREEMENT, auth.STAGE_ACTIVE))
+    for item in items:
+        if item["status"] == "declined":
+            item["decline_step"] = _decline_step(cursor, item["agreement_id"])  # 'review' | 'sign' | ''
     reissued = [i for i in items if i["status"] == "sent" and i["version"] >= 2]
     if reissued:
         cursor.execute(
@@ -448,7 +459,7 @@ def _latest_otp(cursor, agreement_id):
 # --- routes: list and PDF ---------------------------------------------------------------------------------
 
 @bp.get("/vendors/me/agreements")
-@auth.vendor_required(*VIEW_STAGES)
+@auth.vendor_required(*HISTORY_STAGES)
 def list_my_agreements():
     try:
         with _Db() as (_, cursor):
@@ -459,14 +470,14 @@ def list_my_agreements():
 
 
 @bp.get("/vendors/me/agreements/<int:agreement_id>/pdf")
-@auth.vendor_required(*VIEW_STAGES)
+@auth.vendor_required(*HISTORY_STAGES)
 def agreement_pdf_file(agreement_id):
     vendor = g.vendor
     download = request.args.get("download") in ("1", "true")
     try:
         with _Db() as (conn, cursor):
             row = _load(cursor, vendor["vendor_id"], agreement_id)
-            if row is None or row["status"] not in ("sent", "signed"):
+            if row is None or row["status"] not in ("sent", "signed", "declined"):  # a declined one is kept for the vendor's records
                 return _err("Agreement not found.", 404)
             signed = row["status"] == "signed" and row.get("signed_pdf_path")
             path = row["signed_pdf_path"] if signed else row.get("unsigned_pdf_path")
@@ -794,6 +805,68 @@ def sign_agreement(agreement_id):
     }), 200
 
 
+@bp.post("/vendors/me/agreements/<int:agreement_id>/preview")
+@auth.vendor_required(*VIEW_STAGES)
+def preview_signed_agreement(agreement_id):
+    """The agreement as it will look once signed, built from what the vendor has filled in so far. Nothing is saved or recorded and nothing
+    here is trusted for the real signing (sign rebuilds the PDF itself). `final: true` also appends the signing certificate page."""
+    vendor = g.vendor
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return _err("Request body must be JSON.", 400)
+    name = re.sub(r"\s+", " ", data["signer_name"]).strip()[:NAME_MAX] if isinstance(data.get("signer_name"), str) else ""
+    designation = re.sub(r"\s+", " ", data["signer_designation"]).strip()[:NAME_MAX] if isinstance(data.get("signer_designation"), str) else ""
+    method = data.get("method") if data.get("method") in SIGNATURE_METHODS else None
+    signature_png = None
+    if data.get("signature"):
+        try:
+            signature_png = _signature_bytes(data["signature"])
+        except ValueError as err:
+            return _err(str(err), 400)
+    final = data.get("final") is True
+    try:
+        with _Db() as (_, cursor):
+            row = _load(cursor, vendor["vendor_id"], agreement_id)
+        if row is None or row["status"] != "sent":
+            return _err("Agreement not found.", 404)
+        problem = _state_error(row)
+        if problem:
+            return _err(*problem)
+        terms = _json(row["terms_json"])
+        company_signature = terms.pop("company_signature_b64", None)
+        company_png = base64.b64decode(company_signature) if company_signature else None
+        now_text = _ist_text()
+        certificate = None
+        if final and signature_png and method:
+            email = str(vendor["email"] or "").strip()
+            certificate = {
+                "signer_name": name,
+                "signer_designation": designation,
+                "method_label": SIGNATURE_METHODS[method],
+                "signed_at_text": now_text,
+                "ip": _client_ip(),
+                "user_agent": (request.headers.get("User-Agent") or "")[:400],
+                "otp_text": f"Yes, one-time code to {email} confirmed at {now_text}",
+                "confirmed_text": f"Yes, at {now_text}",
+            }
+        verify_url = (f"{_portal_public_url()}/verify-agreement?no={quote(row['agreement_no'])}"
+                      f"&h={(row['unsigned_pdf_sha256'] or '')[:12]}")
+        pdf = agreement_pdf.build_agreement_pdf(
+            terms, company_signature_png=company_png, vendor_signature_png=signature_png, certificate=certificate,
+            document_sha256=row["unsigned_pdf_sha256"], verify_url=verify_url,
+            preview_signer={"name": name, "designation": designation, "signed_line": f"Signed electronically on {now_text}"},
+        )
+    except MySQLError as err:
+        return _err(str(err), 500)
+    except Exception:
+        log.exception("Could not build the agreement preview %s", agreement_id)
+        return _err("Unable to prepare the preview. Please try again.", 500)
+    response = Response(pdf, mimetype="application/pdf")
+    response.headers["Content-Disposition"] = 'inline; filename="agreement-preview.pdf"'
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
+
+
 def _discard_blob(container, path):
     try:
         container.delete_blob(path)
@@ -809,14 +882,28 @@ def decline_agreement(agreement_id):
     data = request.get_json(silent=True)
     reason = data.get("reason") if isinstance(data, dict) else None
     reason = re.sub(r"[ \t]+", " ", reason).strip() if isinstance(reason, str) else ""
-    if not REASON_MIN <= len(reason) <= REASON_MAX:
-        return _err(f"Tell us why in {REASON_MIN} to {REASON_MAX} characters.", 400)
     at_step = data.get("at_step") if isinstance(data, dict) else None
     if at_step is None:
         at_step = "sign"
     if at_step not in ("review", "sign"):
         return _err("at_step must be 'review' or 'sign'.", 400)
+    # At the details review the ticked details say what is wrong, so the note is optional there.
+    if at_step == "review" and not reason and isinstance(data.get("fields"), list) and data["fields"]:
+        reason = "Details need to be corrected."
+    if not REASON_MIN <= len(reason) <= REASON_MAX:
+        return _err(f"Tell us why in {REASON_MIN} to {REASON_MAX} characters.", 400)
     kind = _kind(vendor["status"])
+    # "Something is wrong" at the details review (onboarding) is a change request: the vendor says which details to change, it
+    # goes to the checker's Change requested tab and the checker returns the application for correction. Declining at the signing
+    # step (or a renewal) keeps the plain "agreement declined" flow.
+    change_request = at_step == "review" and kind == "onboarding"
+    requested = data.get("fields") if isinstance(data, dict) else None
+    keys = list(dict.fromkeys(str(key).strip() for key in requested if str(key).strip())) if isinstance(requested, list) else []
+    if change_request and not keys:
+        return _err("Choose at least one detail you want to change.", 400)
+    if change_request and len(keys) > 30:
+        return _err("Choose between 1 and 30 details.", 400)
+    labels = []
     try:
         with _Db() as (conn, cursor):
             row = _load(cursor, vendor_id, agreement_id)
@@ -827,6 +914,13 @@ def decline_agreement(agreement_id):
                 return _err(*problem)
             if kind is None:
                 return _err("This agreement cannot be declined at the moment.", 409)
+            if change_request:
+                cursor.execute("SELECT gstin FROM vendor WHERE vendor_id = %s", (vendor_id,))
+                master = deps["field_master"](bool(str((cursor.fetchone() or {}).get("gstin") or "").strip()))
+                unknown = [key for key in keys if key not in master]
+                if unknown:
+                    return _err("One of the chosen details cannot be changed this way.", 400, fields=unknown)
+                labels = [master[key]["field_label"] for key in keys]
             cursor.execute(
                 "UPDATE vendor_agreement SET status = 'declined', declined_at = NOW(), decline_reason = %s "
                 "WHERE agreement_id = %s AND vendor_id = %s AND status = 'sent' AND (expires_at IS NULL OR expires_at >= NOW())",
@@ -837,19 +931,32 @@ def decline_agreement(agreement_id):
                 latest = _load(cursor, vendor_id, agreement_id) or row
                 return _err(*(_state_error(latest) or ("This agreement is no longer open.", 409)))
             if kind == "onboarding":
-                cursor.execute(
-                    "UPDATE vendor SET status = '01' WHERE vendor_id = %s AND status = %s",
-                    (vendor_id, auth.STATUS_AGREEMENT_SENT),
-                )
+                if change_request:
+                    cursor.execute(
+                        "UPDATE vendor SET status = %s, correction_fields = %s WHERE vendor_id = %s AND status = %s",
+                        (auth.STATUS_CHANGE_REQ_CHECKER, ",".join(keys), vendor_id, auth.STATUS_AGREEMENT_SENT),
+                    )
+                else:
+                    cursor.execute(
+                        "UPDATE vendor SET status = '01' WHERE vendor_id = %s AND status = %s",
+                        (vendor_id, auth.STATUS_AGREEMENT_SENT),
+                    )
                 if cursor.rowcount != 1:
                     conn.rollback()
                     return _err("Your application has just moved on. Please refresh.", 409)
-            _event(cursor, agreement_id, "declined", email, _client_ip(), {"reason": reason, "at_step": at_step})
+            _event(cursor, agreement_id, "declined", email, _client_ip(), {"reason": reason, "at_step": at_step, **({"fields": keys} if change_request else {})})
             conn.commit()
     except MySQLError as err:
         return _err(str(err), 500)
 
     vendor_name, _ = _vendor_names(vendor_id)
+    if change_request:
+        try:
+            deps["change_request_email"]({"vendor_id": vendor_id, "vendor_legal_name": vendor_name, "email": email},
+                                         auth.STATUS_CHANGE_REQ_CHECKER, labels)
+        except Exception:  # an email problem must never fail the request
+            log.exception("Change-request email for vendor %s failed", vendor_id)
+        return jsonify({"message": "Your change request was sent.", "stage": auth.STAGE_CHANGE_REQUESTED}), 200
     _notify("VENDOR_AGREEMENT_DECLINED_TEMPLATE", _checker_emails(), f"Vendor declined agreement - {vendor_name}",
             {"vendor_name": vendor_name, "agreement_no": row["agreement_no"], "reason": reason,
              "review_url": deps.get("frontend_url")})

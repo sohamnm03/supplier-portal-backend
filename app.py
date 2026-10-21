@@ -175,25 +175,28 @@ def _find_duplicate_identity(values, exclude_vendor_id=None):
     return None
 
 
-def _validate_vendor_values(values, existing=None):
+def _validate_vendor_values(values, existing=None, draft=False):
     """Return an error message for invalid vendor data, or None.
+
+    `draft`: saving progress, not submitting. Only what would break the database is refused (the CIN / Udyam lengths); the business
+    rules (required, allowed values, Udyam when registered) are enforced when the application is submitted.
 
     `values` holds the fields being written; `existing` is the stored row (PATCH)
     so cross-field rules can see the final state.
     """
     for field in REQUIRED_FIELDS:
-        if field in values and not str(values[field] or "").strip():
+        if not draft and field in values and not str(values[field] or "").strip():
             return f"{field} cannot be empty"
 
-    if values.get("msme_status") and values["msme_status"] not in MSME_STATUSES:
+    if not draft and values.get("msme_status") and values["msme_status"] not in MSME_STATUSES:
         return "msme_status must be one of: " + ", ".join(sorted(MSME_STATUSES))
-    if values.get("vendor_type") and values["vendor_type"] not in VENDOR_TYPES:
+    if not draft and values.get("vendor_type") and values["vendor_type"] not in VENDOR_TYPES:
         return "vendor_type is not a recognised value"
-    if values.get("assigned_rm") and values["assigned_rm"] not in ASSIGNED_RMS:
+    if not draft and values.get("assigned_rm") and values["assigned_rm"] not in ASSIGNED_RMS:
         return "assigned_rm is not a recognised value"
 
     final = {**(existing or {}), **values}
-    if final.get("msme_status") == "Registered" and not str(final.get("udyam_number") or "").strip():
+    if not draft and final.get("msme_status") == "Registered" and not str(final.get("udyam_number") or "").strip():
         return "udyam_number is required when msme_status is Registered"
     # CIN is a 21-character code and the Udyam number column holds 30: anything else would only fail in the database.
     cin = str(final.get("cin") or "").strip()
@@ -669,12 +672,11 @@ def save_my_draft():
     values = _onboarding_values(data)
     # Drafts may be incomplete, so only the values actually provided are validated.
     provided = {field: value for field, value in values.items() if value is not None}
-    validation_error = _validate_vendor_values(provided)
+    validation_error = _validate_vendor_values(provided, draft=True)
     if validation_error:
         return jsonify({"error": validation_error}), 400
-    duplicate_error = _find_duplicate_identity({"pan": values.get("pan")}, exclude_vendor_id=vendor_id)
-    if duplicate_error:
-        return jsonify({"error": duplicate_error}), 409
+    # No duplicate-PAN check here: saving progress (and logging out) must always work, so the draft keeps exactly what was entered.
+    # The PAN is checked again when the vendor continues past the first step and when the application is submitted.
 
     try:
         _save_onboarding(vendor_id, _load_vendor_row(vendor_id), values)
@@ -866,7 +868,7 @@ def _send_change_request_email(vendor, new_status, labels):
 
 
 @app.get("/vendors/me/change-request/fields")
-@auth.vendor_required(auth.STAGE_MAKER_REVIEW, auth.STAGE_CHECKER_REVIEW)
+@auth.vendor_required(auth.STAGE_MAKER_REVIEW, auth.STAGE_CHECKER_REVIEW, auth.STAGE_AGREEMENT)
 def change_request_fields():
     """The form fields a vendor can ask to change."""
     conn = get_connection()
@@ -2160,6 +2162,8 @@ agreements.configure(
     email_verification_request=lambda *args, **kwargs: _email_verification_request(*args, **kwargs),
     verified_email_error=lambda *args, **kwargs: _verified_email_error(*args, **kwargs),
     docs_container=lambda: _docs_container(),
+    field_master=lambda *args, **kwargs: _field_master(*args, **kwargs),
+    change_request_email=lambda *args, **kwargs: _send_change_request_email(*args, **kwargs),
     frontend_url=FRONTEND_BASE_URL,
     maker_email=MAKER_EMAIL,
     support_email=SUPPORT_EMAIL,
