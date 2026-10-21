@@ -67,7 +67,7 @@ class FakeState:
         row = {
             "agreement_id": agreement_id, "agreement_no": no, "vendor_id": vendor_id, "version": version, "status": status,
             "terms_json": json.dumps(make_terms(no, version, end=end)),
-            "unsigned_pdf_path": f"agreements/vendor_{vendor_id}/{no}.pdf",
+            "unsigned_pdf_path": f"vendor_{vendor_id}/agreement_{no}.pdf",
             "unsigned_pdf_sha256": f"{agreement_id:02d}" * 32,
             "signed_pdf_path": None, "signed_pdf_sha256": None, "issued_at": self.now - timedelta(days=2),
             "expires_at": self.now + timedelta(days=expires_in_days), "first_viewed_at": None, "signed_at": None,
@@ -217,10 +217,11 @@ class FakeDb:
 
 class FakeContainer:
     def __init__(self):
-        self.blobs, self.uploads, self.deleted = {}, [], []
+        self.blobs, self.uploads, self.deleted, self.metadata = {}, [], [], {}
 
-    def upload_blob(self, name, data, overwrite=False, content_settings=None):
+    def upload_blob(self, name, data, overwrite=False, content_settings=None, metadata=None):
         self.blobs[name] = data
+        self.metadata[name] = metadata
         self.uploads.append(name)
 
     def delete_blob(self, name):
@@ -304,9 +305,3 @@ def env(monkeypatch):
 
     e.send_code = send_code
     return e
-
-
-@pytest.fixture(autouse=True)
-def _no_local_agreement_dir(monkeypatch):
-    """The developer's .env may set AGREEMENT_LOCAL_DIR (the local-disk stand-in for Azure); tests decide storage themselves."""
-    monkeypatch.delenv("AGREEMENT_LOCAL_DIR", raising=False)

@@ -9,7 +9,6 @@ import base64
 import binascii
 import hmac
 import json
-from pathlib import Path
 import logging
 import os
 import re
@@ -36,6 +35,8 @@ NAME_MIN, NAME_MAX = 2, 150
 REASON_MIN, REASON_MAX = 3, 500
 CHECKER_GROUP = "CHECKER"
 SIGNATURE_METHODS = {"draw": "Drawn signature", "type": "Typed signature", "upload": "Uploaded signature image"}
+# Blob metadata doc_type of an agreement filed in the vendor's documents folder (the enterprise app files the unsigned copy the same way).
+AGREEMENT_DOC_TYPE = "agreement"
 _DATA_URL = re.compile(r"^data:image/(?:png|jpeg|jpg);base64,([A-Za-z0-9+/=\s]+)$")
 
 # Stages that may see the Agreement screen; the actions also include agreement_signed so a double click gets a clear 409.
@@ -49,47 +50,9 @@ HISTORY_STAGES = VIEW_STAGES + (auth.STAGE_CHECKER_REVIEW, auth.STAGE_MAKER_REVI
 deps = {}
 
 
-class _LocalContainer:
-    """The few container calls this module makes, backed by a folder on local disk. Only used when Azure Blob Storage is not configured and
-    AGREEMENT_LOCAL_DIR is set (a demo / development setup where both backends share one folder)."""
-
-    def __init__(self, base):
-        self.base = Path(base).resolve()
-
-    def _path(self, name):
-        target = (self.base / name).resolve()
-        if target != self.base and self.base not in target.parents:
-            raise ValueError("Invalid agreement file path.")
-        return target
-
-    def upload_blob(self, name, data, overwrite=True, content_settings=None):
-        path = self._path(name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
-
-    def delete_blob(self, name):
-        self._path(name).unlink(missing_ok=True)
-
-    def get_blob_client(self, name):
-        path = self._path(name)
-
-        class _Reader:
-            def download_blob(self_inner):
-                class _Data:
-                    def readall(self_data):
-                        return path.read_bytes()
-                return _Data()
-
-        return _Reader()
-
-
 def _storage():
-    """The blob container for agreement files, the local-disk stand-in when Azure is not configured, or None."""
-    container = deps["docs_container"]()
-    if container is None and os.getenv("AGREEMENT_LOCAL_DIR"):
-        return _LocalContainer(os.environ["AGREEMENT_LOCAL_DIR"])
-    return container
-
+    """The blob container for agreement files (the vendor documents container), or None when Azure Blob Storage is not configured."""
+    return deps["docs_container"]()
 
 
 def configure(**kwargs):
@@ -747,10 +710,17 @@ def sign_agreement(agreement_id):
             container = _storage()
             if container is None:
                 return _err("Document storage is not configured. Please try again later.", 503)
-            blob_path = f"agreements/vendor_{vendor_id}/{row['agreement_no']}_signed.pdf"
+            # Filed with the vendor's other documents: vendor_<id>/agreement_<no>_signed.pdf, same blob metadata as a supporting document.
+            blob_path = f"vendor_{vendor_id}/{AGREEMENT_DOC_TYPE}_{row['agreement_no']}_signed.pdf"
             try:
                 container.upload_blob(blob_path, pdf, overwrite=True,
-                                      content_settings=ContentSettings(content_type="application/pdf"))
+                                      content_settings=ContentSettings(content_type="application/pdf"),
+                                      metadata={
+                                          "vendor_id": str(vendor_id),
+                                          "doc_type": AGREEMENT_DOC_TYPE,
+                                          "original_name": quote(f"{row['agreement_no']}_signed.pdf", safe=""),
+                                          "uploaded_at": _ist_text(),
+                                      })
             except AzureError:
                 log.exception("Could not upload %s", blob_path)
                 return _err("Unable to save the signed agreement. Please try again.", 502)

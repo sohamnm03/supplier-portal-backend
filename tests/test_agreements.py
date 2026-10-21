@@ -3,6 +3,7 @@ from datetime import timedelta
 import pytest
 
 import agreements
+import app as portal
 import auth
 from conftest import FakeResponse
 
@@ -98,7 +99,7 @@ def test_me_includes_open_agreement(env, monkeypatch):
 
 def test_pdf_first_view_and_download(env):
     env.state.add_agreement(1, 1, "sent")
-    env.container.blobs["agreements/vendor_7/AGR-2026-00001.pdf"] = b"%PDF-unsigned"
+    env.container.blobs["vendor_7/agreement_AGR-2026-00001.pdf"] = b"%PDF-unsigned"
     env.db.commit_now()
     r = env.client.get("/vendors/me/agreements/1/pdf", headers=env.headers)
     assert r.status_code == 200 and r.data == b"%PDF-unsigned" and r.mimetype == "application/pdf"
@@ -120,10 +121,10 @@ def test_pdf_other_vendors_agreement_404(env):
 
 def test_pdf_declined_hidden_and_signed_copy_served(env):
     env.state.add_agreement(1, 1, "declined")
-    env.state.add_agreement(2, 2, "signed", signed_pdf_path="agreements/vendor_7/AGR-2026-00002_signed.pdf")
-    env.container.blobs["agreements/vendor_7/AGR-2026-00002_signed.pdf"] = b"%PDF-signed"
+    env.state.add_agreement(2, 2, "signed", signed_pdf_path="vendor_7/agreement_AGR-2026-00002_signed.pdf")
+    env.container.blobs["vendor_7/agreement_AGR-2026-00002_signed.pdf"] = b"%PDF-signed"
     env.db.commit_now()
-    env.container.blobs["agreements/vendor_7/AGR-2026-00001.pdf"] = b"%PDF-unsigned"
+    env.container.blobs["vendor_7/agreement_AGR-2026-00001.pdf"] = b"%PDF-unsigned"
     assert env.client.get("/vendors/me/agreements/1/pdf", headers=env.headers).data == b"%PDF-unsigned"  # a declined one is kept as issued
     assert env.client.get("/vendors/me/agreements/2/pdf", headers=env.headers).data == b"%PDF-signed"
 
@@ -195,7 +196,7 @@ def test_sign_onboarding_happy_path(env, monkeypatch):
     assert r.get_json()["stage"] == "agreement_signed"
     row = env.state.agreements[1]
     assert row["status"] == "signed" and row["signer_name"] == "Vee Vendor" and row["signature_method"] == "draw"
-    assert row["signed_pdf_path"] == "agreements/vendor_7/AGR-2026-00001_signed.pdf"
+    assert row["signed_pdf_path"] == "vendor_7/agreement_AGR-2026-00001_signed.pdf"
     assert row["vendor_id"] == 7
     assert env.state.vendors[7]["status"] == "agreement_signed"
     assert env.container.uploads == [row["signed_pdf_path"]]  # uploaded once
@@ -316,7 +317,7 @@ def test_sign_withdrawn_during_signing_discards_upload(env, monkeypatch):
     r = env.client.post("/vendors/me/agreements/1/sign", headers=env.headers, json=env.sign_body())
     assert r.status_code == 409 and "withdrawn" in r.get_json()["error"]
     assert env.state.vendors[7]["status"] == "agreement_sent"
-    assert env.container.deleted == ["agreements/vendor_7/AGR-2026-00001_signed.pdf"]
+    assert env.container.deleted == ["vendor_7/agreement_AGR-2026-00001_signed.pdf"]
 
 
 def test_sign_expired_is_410(env):
@@ -637,3 +638,80 @@ def test_preview_refusals(env):
     assert post(2).status_code == 404  # only an open agreement can be previewed
     assert post(99).status_code == 404
     assert env.client.post("/vendors/me/agreements/1/preview", json={}).status_code == 401
+
+
+# --- the signed copy is filed in the vendor's documents folder -------------------------------------------------
+
+def test_signed_copy_is_filed_in_the_vendors_folder_with_document_metadata(env):
+    prepared_onboarding(env)
+    assert env.client.post("/vendors/me/agreements/1/sign", headers=env.headers, json=env.sign_body()).status_code == 200
+    name = "vendor_7/agreement_AGR-2026-00001_signed.pdf"
+    assert env.container.uploads == [name]
+    meta = env.container.metadata[name]
+    assert meta["vendor_id"] == "7" and meta["doc_type"] == "agreement"
+    assert meta["original_name"] == "AGR-2026-00001_signed.pdf" and meta["uploaded_at"].endswith("IST")
+
+
+def test_the_local_disk_fallback_is_gone(env, monkeypatch, tmp_path):
+    prepared_onboarding(env)
+    monkeypatch.setenv("AGREEMENT_LOCAL_DIR", str(tmp_path))
+    monkeypatch.setitem(agreements.deps, "docs_container", lambda: None)
+    r = env.client.post("/vendors/me/agreements/1/sign", headers=env.headers, json=env.sign_body())
+    assert r.status_code == 503 and env.state.agreements[1]["status"] == "sent"
+    assert list(tmp_path.iterdir()) == []
+
+
+class _FolderContainer:
+    """list_blobs / upload_blob / delete_blob over a dict of {name: metadata}, as the supporting-documents routes use them."""
+
+    def __init__(self, blobs):
+        self.blobs, self.uploaded, self.deleted = dict(blobs), [], []
+
+    def list_blobs(self, name_starts_with="", include=None):
+        from types import SimpleNamespace
+        return [SimpleNamespace(name=n, metadata=m, size=10) for n, m in self.blobs.items() if n.startswith(name_starts_with)]
+
+    def upload_blob(self, name, data, overwrite=False, content_settings=None, metadata=None):
+        self.blobs[name] = metadata
+        self.uploaded.append(name)
+
+    def delete_blob(self, name):
+        self.blobs.pop(name, None)
+        self.deleted.append(name)
+
+
+def test_my_documents_list_leaves_out_agreements(env, monkeypatch):
+    folder = _FolderContainer({
+        "vendor_7/pan_abc.pdf": {"doc_type": "pan", "original_name": "pan.pdf"},
+        "vendor_7/agreement_AGR-2026-00001_signed.pdf": {"doc_type": "agreement", "original_name": "AGR-2026-00001_signed.pdf"},
+    })
+    monkeypatch.setattr(portal, "_docs_container", lambda: folder)
+    r = env.client.get("/vendors/me/documents", headers=env.headers)
+    assert r.status_code == 200
+    assert [d["type"] for d in r.get_json()["documents"]] == ["pan"]
+
+
+def test_agreements_do_not_count_against_the_upload_cap(env, monkeypatch):
+    import io
+    # 15 supporting documents + 3 agreements: only the 15 count, so one more document still fits (16 allowed).
+    blobs = {f"vendor_7/other_{i}.pdf": {"doc_type": "other"} for i in range(15)}
+    blobs.update({f"vendor_7/agreement_AGR-2026-0000{i}_signed.pdf": {"doc_type": "agreement"} for i in range(1, 4)})
+    folder = _FolderContainer(blobs)
+    monkeypatch.setattr(portal, "_docs_container", lambda: folder)
+    env.state.vendors[7]["status"] = "returned"
+
+    class _Cursor:
+        def execute(self, *args): pass
+        def fetchone(self): return {"vendor_id": 7, "status": "returned"}
+        def close(self): pass
+
+    class _Conn:
+        def cursor(self, **kwargs): return _Cursor()
+        def close(self): pass
+
+    monkeypatch.setattr(portal, "get_connection", lambda: _Conn())
+    monkeypatch.setattr(portal.rejections, "mark_fixed", lambda *args: None)
+    r = env.client.post("/vendors/7/documents", headers=env.headers,
+                        data={"pan": (io.BytesIO(b"%PDF-1.4 pan"), "pan.pdf")}, content_type="multipart/form-data")
+    assert r.status_code == 201, r.get_json()
+    assert len(folder.uploaded) == 1 and folder.deleted == []
