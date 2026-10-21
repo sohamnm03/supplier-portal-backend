@@ -1055,7 +1055,10 @@ def upload_vendor_documents(vendor_id):
         # Uploading a document type replaces what was on file for it (a vendor fixing a returned application).
         replaced_prefixes = {f"{prefix}{doc_type}_" for doc_type, *_ in staged}
         replaced_blobs = [blob.name for blob in existing_blobs if blob.name.startswith(tuple(replaced_prefixes))]
-        if len(existing_blobs) - len(replaced_blobs) + len(staged) > DOCUMENT_MAX_PER_VENDOR:
+        # Signed agreements share the folder but are not uploads (see agreements.AGREEMENT_DOC_TYPE): they do not count against the cap.
+        agreement_prefix = f"{prefix}{agreements.AGREEMENT_DOC_TYPE}_"
+        kept_blobs = [blob for blob in existing_blobs if not blob.name.startswith(agreement_prefix)]
+        if len(kept_blobs) - len(replaced_blobs) + len(staged) > DOCUMENT_MAX_PER_VENDOR:
             return jsonify({"error": "This request already has the maximum number of documents."}), 400
 
         for doc_type, original_name, extension, content in staged:
@@ -1115,6 +1118,8 @@ def list_my_documents():
     try:
         for blob in container.list_blobs(name_starts_with=f"vendor_{vendor_id}/", include=["metadata"]):
             metadata = blob.metadata or {}
+            if metadata.get("doc_type") == agreements.AGREEMENT_DOC_TYPE:
+                continue  # agreements are listed on the Agreement screen, not with the supporting documents
             documents.append({
                 "type": metadata.get("doc_type"),
                 "original_name": unquote(metadata.get("original_name") or blob.name.rsplit("/", 1)[-1]),

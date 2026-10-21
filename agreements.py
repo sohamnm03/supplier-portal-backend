@@ -35,6 +35,8 @@ NAME_MIN, NAME_MAX = 2, 150
 REASON_MIN, REASON_MAX = 3, 500
 CHECKER_GROUP = "CHECKER"
 SIGNATURE_METHODS = {"draw": "Drawn signature", "type": "Typed signature", "upload": "Uploaded signature image"}
+# Blob metadata doc_type of an agreement filed in the vendor's documents folder (the enterprise app files the unsigned copy the same way).
+AGREEMENT_DOC_TYPE = "agreement"
 _DATA_URL = re.compile(r"^data:image/(?:png|jpeg|jpg);base64,([A-Za-z0-9+/=\s]+)$")
 
 # Stages that may see the Agreement screen; the actions also include agreement_signed so a double click gets a clear 409.
@@ -49,9 +51,8 @@ deps = {}
 
 
 def _storage():
-    """The blob container for agreement files, or None when Azure storage is not configured."""
+    """The blob container for agreement files (the vendor documents container), or None when Azure Blob Storage is not configured."""
     return deps["docs_container"]()
-
 
 
 def configure(**kwargs):
@@ -709,10 +710,17 @@ def sign_agreement(agreement_id):
             container = _storage()
             if container is None:
                 return _err("Document storage is not configured. Please try again later.", 503)
-            blob_path = f"vendor_{vendor_id}/{row['agreement_no']}_signed.pdf"
+            # Filed with the vendor's other documents: vendor_<id>/agreement_<no>_signed.pdf, same blob metadata as a supporting document.
+            blob_path = f"vendor_{vendor_id}/{AGREEMENT_DOC_TYPE}_{row['agreement_no']}_signed.pdf"
             try:
                 container.upload_blob(blob_path, pdf, overwrite=True,
-                                      content_settings=ContentSettings(content_type="application/pdf"))
+                                      content_settings=ContentSettings(content_type="application/pdf"),
+                                      metadata={
+                                          "vendor_id": str(vendor_id),
+                                          "doc_type": AGREEMENT_DOC_TYPE,
+                                          "original_name": quote(f"{row['agreement_no']}_signed.pdf", safe=""),
+                                          "uploaded_at": _ist_text(),
+                                      })
             except AzureError:
                 log.exception("Could not upload %s", blob_path)
                 return _err("Unable to save the signed agreement. Please try again.", 502)
