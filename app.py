@@ -38,6 +38,12 @@ FRONTEND_BASE_URL = "http://localhost:5173/"
 SUPPORT_EMAIL = "support@fourthsignal.com"
 MAKER_EMAIL = "soham.m@fourthsignal.com"
 REVIEW_DAYS = 3
+# Where the business team reviews invoices (the enterprise app), for the link in the MSME invoice email.
+ENTERPRISE_APP_URL = os.getenv("ENTERPRISE_APP_URL", FRONTEND_BASE_URL)
+# Invoice from an MSME vendor: emailed to the groups wired to this event on the enterprise app's Configure Emails screen.
+MSME_INVOICE_TEMPLATE = "invoice_msme_received"
+MSME_EVENT_CODE = "INVOICE_MSME_RECEIVED"
+MSME_PAYMENT_DAYS = 45
 MAKER_VENDOR_ID = "maker"
 # The credentials email is the same template that used to go out when a checker approved a vendor (it already
 # carries the username, password and login link).
@@ -324,19 +330,18 @@ def generate_password():
     return password, hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 
-def _send_email(to, subject, template_name, params):
+def _send_email(to, subject, template_name, params, cc=None):
     """Call the shared email service. Never raises: a failed email must not fail the request."""
+    body = {
+        "to": to,
+        "subject": subject,
+        "template_name": template_name,
+        "params": params,
+    }
+    if cc:
+        body["cc"] = cc
     try:
-        requests.post(
-            EMAIL_API_URL,
-            json={
-                "to": to,
-                "subject": subject,
-                "template_name": template_name,
-                "params": params,
-            },
-            timeout=10,
-        ).raise_for_status()
+        requests.post(EMAIL_API_URL, json=body, timeout=10).raise_for_status()
         return True
     except requests.RequestException as err:
         app.logger.warning("Email '%s' to %s failed: %s", template_name, to, err)
@@ -443,7 +448,95 @@ def _send_registration_emails(vendor_id, vendor_name, vendor_email, resubmission
     )
 
 
-def _send_invoice_emails(vendor_name, vendor_email, invoice_number, total_amount, currency):
+def _msme_category(msme_status):
+    """The category the MSME email shows, or None when the vendor is not an MSME. The portal's own status list is only
+    Registered / Not registered / Not applicable (no Micro / Small / Medium), so a "Registered" vendor has no category to give:
+    that is sent as "Not specified" rather than guessed. A tier recorded by the enterprise app's form is passed through."""
+    status = str(msme_status or "").strip().lower()
+    if status in ("micro", "small", "medium"):
+        return status.capitalize()
+    if status == "registered":
+        return "Not specified"
+    return None
+
+
+def _format_amount(value, currency):
+    """₹12,50,000.00 for INR (lakh / crore grouping), "USD 1,250,000.00" otherwise: the MSME email shows this verbatim."""
+    amount = Decimal(str(value)).quantize(Decimal("0.01"))
+    whole, _, fraction = f"{abs(amount):.2f}".partition(".")
+    code = (currency or "INR").upper()
+    if code == "INR" and len(whole) > 3:
+        head, tail, groups = whole[:-3], whole[-3:], []
+        while len(head) > 2:
+            groups.insert(0, head[-2:])
+            head = head[:-2]
+        whole = ",".join([head, *groups, tail])
+    elif code != "INR":
+        whole = f"{int(whole):,}"
+    return f"{'-' if amount < 0 else ''}{'₹' if code == 'INR' else code + ' '}{whole}.{fraction}"
+
+
+def _msme_recipients():
+    """Who gets the MSME invoice email: the groups wired to the INVOICE_MSME_RECEIVED event on the enterprise app's
+    Configure Emails screen (same database), so one screen controls both apps. Falls back to the maker when the event is not
+    set up yet or the lookup fails, so the alert is never silently dropped."""
+    conn = cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT DISTINCT m.email_id FROM notification_events e "
+            "JOIN notification_event_recipients r ON r.event_id = e.event_id AND r.is_active = 1 "
+            "JOIN email_group_members m ON m.group_id = r.group_id AND m.is_active = 1 "
+            "WHERE e.event_code = %s AND e.is_active = 1 ORDER BY m.email_id",
+            (MSME_EVENT_CODE,),
+        )
+        emails = [row[0] for row in cursor.fetchall() if row[0]]
+    except MySQLError as err:
+        app.logger.warning("MSME email recipients lookup failed, using the maker: %s", err)
+        emails = []
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+    return emails or [MAKER_EMAIL]
+
+
+def _send_msme_invoice_email(vendor, invoice_number, total_amount, currency, invoice_date):
+    """Emails the business team that an invoice arrived from an MSME vendor. True when it was sent; False when the vendor
+    is not an MSME or the send failed (the caller then falls back to the generic alert).
+
+    The payment deadline is 45 days from the invoice date (today when the invoice carries none), the same rule the enterprise
+    app's MSME tracker uses."""
+    category = _msme_category(vendor.get("msme_status"))
+    if category is None:
+        return False
+    due = (invoice_date or datetime.now(IST).date()) + timedelta(days=MSME_PAYMENT_DAYS)
+    to, *cc = _msme_recipients()
+    vendor_name = vendor.get("vendor_legal_name") or ""
+    return _send_email(
+        to,
+        f"MSME invoice received: {vendor_name} {invoice_number}",
+        MSME_INVOICE_TEMPLATE,
+        {
+            "vendor_name": vendor_name,
+            "invoice_number": invoice_number,
+            "invoice_amount": _format_amount(total_amount, currency) if total_amount is not None else "N/A",
+            "msme_category": category,
+            "udyam_number": str(vendor.get("udyam_number") or ""),
+            "received_at": _now_ist_text(),
+            "payment_due_date": due.strftime("%d %b %Y"),
+            "review_url": ENTERPRISE_APP_URL,
+        },
+        cc=cc,
+    )
+
+
+def _send_invoice_emails(vendor_name, vendor_email, invoice_number, total_amount, currency, vendor=None, invoice_date=None):
+    """The vendor's receipt, plus the alert to the business team. `vendor` is the vendor row (needs msme_status,
+    udyam_number, vendor_legal_name): for an MSME vendor the MSME email replaces the generic "new invoice needs review"
+    one, so the maker is not told twice about the same invoice."""
     amount_text = f"{currency or 'INR'} {total_amount:,.2f}" if total_amount is not None else "N/A"
     _send_email(
         vendor_email,
@@ -457,6 +550,8 @@ def _send_invoice_emails(vendor_name, vendor_email, invoice_number, total_amount
             "support_email": SUPPORT_EMAIL,
         },
     )
+    if vendor is not None and _send_msme_invoice_email(vendor, invoice_number, total_amount, currency, invoice_date):
+        return
     _send_email(
         MAKER_EMAIL,
         f"New invoice needs review - {invoice_number}",
@@ -1720,7 +1815,7 @@ def upload_invoice_for_ocr():
         validation_conn = get_connection()
         validation_cursor = validation_conn.cursor(dictionary=True)
         validation_cursor.execute(
-            "SELECT vendor_id, email, vendor_legal_name FROM vendor "
+            "SELECT vendor_id, email, vendor_legal_name, msme_status, udyam_number FROM vendor "
             "WHERE vendor_id = %s LIMIT 1",
             (vendor_id,),
         )
@@ -1786,6 +1881,8 @@ def upload_invoice_for_ocr():
             invoice_number or invoice_file.filename,
             invoice_values["total_amount"],
             invoice_values["currency"],
+            vendor=vendor_row,
+            invoice_date=invoice_values.get("invoice_date"),
         )
 
     return jsonify(
@@ -1927,9 +2024,10 @@ def replace_invoice(invoice_id):
                 {"error": "This invoice has not been returned to you, so it cannot be replaced."}
             ), 409
         cursor.execute(
-            "SELECT vendor_legal_name FROM vendor WHERE vendor_id = %s LIMIT 1", (vendor_id,)
+            "SELECT vendor_legal_name, msme_status, udyam_number FROM vendor WHERE vendor_id = %s LIMIT 1", (vendor_id,)
         )
-        vendor_name = (cursor.fetchone() or {}).get("vendor_legal_name")
+        vendor_row = cursor.fetchone() or {}
+        vendor_name = vendor_row.get("vendor_legal_name")
     except MySQLError as err:
         return jsonify({"error": str(err)}), 500
     finally:
@@ -2000,6 +2098,8 @@ def replace_invoice(invoice_id):
             parsed["invoice_number"] or invoice_file.filename,
             invoice_values["total_amount"],
             invoice_values["currency"],
+            vendor=vendor_row,
+            invoice_date=invoice_values.get("invoice_date"),
         )
 
     return jsonify(
