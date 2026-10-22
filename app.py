@@ -13,12 +13,14 @@ from urllib.parse import quote, unquote
 import requests
 from azure.core.exceptions import AzureError
 from azure.storage.blob import BlobServiceClient, ContentSettings
-from flask import Flask, g, jsonify, request
+from flask import Flask, Response, g, jsonify, request
 from flask_cors import CORS
 from mysql.connector import Error as MySQLError
 
+import agreement_hold
 import agreements
 import auth
+import invoice_versions
 import rejections
 import update_requests
 import verification
@@ -145,22 +147,38 @@ def _clean_tax_id(value):
     return value.strip().lstrip(":;.- 	").strip() or None
 
 
+# Who holds a PAN or an email. A PAN is claimed only by a SUBMITTED application: not a maker's saved draft (is_draft = 1), not a vendor
+# who has only signed up and is still filling the form ('registered'), not a rejected one. The email is the login, so any real account
+# holds it (a signed-up 'registered' vendor included), but not a maker's draft or a rejected application.
+PAN_CLAIMED_SQL = "is_draft = 0 AND LOWER(status) NOT IN ('registered', 'rejected')"
+EMAIL_HELD_SQL = "is_draft = 0 AND LOWER(status) <> 'rejected'"
+
+
+def pan_duplicate_check_enabled():
+    """Whether a PAN already held by a submitted vendor is refused (VENDOR_PAN_DUPLICATE_CHECK: true / 1 / yes / on).
+
+    TODO: re-enable after testing. It is OFF by default for now (testing and demos reuse one vendor's PAN); the email checks, the PAN / GSTIN /
+    Aadhaar verification and the PAN-belongs-to-GSTIN checks are not affected by this switch."""
+    return (os.getenv("VENDOR_PAN_DUPLICATE_CHECK") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _find_duplicate_identity(values, exclude_vendor_id=None):
     """Return a message if the PAN or email in `values` already belongs to another vendor."""
     checks = [
-        ("pan", "PAN", lambda v: str(v).strip().upper(), "UPPER(TRIM(pan))"),
-        ("email", "email", lambda v: str(v).strip().lower(), "LOWER(TRIM(email))"),
+        ("pan", "PAN", lambda v: str(v).strip().upper(), "UPPER(TRIM(pan))", PAN_CLAIMED_SQL),
+        ("email", "email", lambda v: str(v).strip().lower(), "LOWER(TRIM(email))", EMAIL_HELD_SQL),
     ]
     conn = cursor = None
     try:
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
-        for field, label, normalise, column_sql in checks:
+        for field, label, normalise, column_sql, holds_sql in checks:
             if not values.get(field) or not str(values[field]).strip():
                 continue
+            if field == "pan" and not pan_duplicate_check_enabled():
+                continue  # TODO: re-enable after testing
             cursor.execute(
-                # A rejected application no longer holds its email or PAN, so the vendor can apply again.
-                f"SELECT vendor_id FROM vendor WHERE {column_sql} = %s AND vendor_id <> %s AND LOWER(status) <> 'rejected' LIMIT 1",
+                f"SELECT vendor_id FROM vendor WHERE {column_sql} = %s AND vendor_id <> %s AND {holds_sql} LIMIT 1",
                 (normalise(values[field]), exclude_vendor_id if exclude_vendor_id is not None else -1),
             )
             if cursor.fetchone():
@@ -528,6 +546,12 @@ def _vendor_with_progress(vendor_id):
     vendor["agreement"] = agreements.open_agreement_summary(vendor_id, vendor["stage"])
     # When the vendor's newest agreement was declined (the application is back with the checker), say so.
     vendor["declined_agreement"] = agreements.declined_agreement_summary(vendor_id)
+    # On hold (no agreement in force) and the agreement's expiry, derived from the signed agreements' dates.
+    try:
+        vendor["agreement_hold"], vendor["agreement_expiry"] = agreement_hold.state_for(vendor_id, vendor.get("status"))
+    except MySQLError:
+        app.logger.exception("Could not read the agreement hold for vendor %s", vendor_id)
+        vendor["agreement_hold"], vendor["agreement_expiry"] = None, None
     # The rejecter's name is internal; the vendor only learns whether it was the maker's or checker's review.
     return vendor
 
@@ -662,6 +686,7 @@ def _load_vendor_row(vendor_id):
 
 @app.put("/vendors/me/draft")
 @auth.vendor_required(auth.STAGE_DRAFT, auth.STAGE_RETURNED)
+@agreement_hold.write_guard
 def save_my_draft():
     """Save the onboarding form as it stands (partial is fine). Only the values sent are written."""
     data = request.get_json(silent=True)
@@ -687,6 +712,7 @@ def save_my_draft():
 
 @app.post("/vendors/me/submit")
 @auth.vendor_required(auth.STAGE_DRAFT, auth.STAGE_RETURNED)
+@agreement_hold.write_guard
 def submit_my_application():
     """Submit (or resubmit after a return) the application to the maker. Review then runs as for any new vendor."""
     data = request.get_json(silent=True)
@@ -749,6 +775,7 @@ def submit_my_application():
 
 @app.post("/vendors/verify/<service>")
 @auth.vendor_required(auth.STAGE_DRAFT, auth.STAGE_RETURNED)
+@agreement_hold.write_guard
 def verify_identity(service):
     """Verify a PAN, GSTIN or Aadhaar number for the onboarding form (service is pan, gstin or aadhaar).
 
@@ -884,6 +911,7 @@ def change_request_fields():
 
 @app.post("/vendors/me/change-request")
 @auth.vendor_required(auth.STAGE_MAKER_REVIEW, auth.STAGE_CHECKER_REVIEW)
+@agreement_hold.write_guard
 def request_changes():
     """The vendor asks to change the ticked fields while their application is under review."""
     data = request.get_json(silent=True)
@@ -929,6 +957,7 @@ def request_changes():
 
 @app.post("/vendors/me/change-request/cancel")
 @auth.vendor_required(auth.STAGE_CHANGE_REQUESTED)
+@agreement_hold.write_guard
 def cancel_change_request():
     """The vendor withdraws the request: the application goes back to the queue it was in."""
     vendor_id = g.vendor["vendor_id"]
@@ -1001,6 +1030,7 @@ def _docs_container():
 
 @app.post("/vendors/<int:vendor_id>/documents")
 @auth.vendor_required(auth.STAGE_DRAFT, auth.STAGE_RETURNED)
+@agreement_hold.write_guard
 def upload_vendor_documents(vendor_id):
     conn = cursor = None
     try:
@@ -1052,9 +1082,17 @@ def upload_vendor_documents(vendor_id):
     saved = []
     try:
         existing_blobs = list(container.list_blobs(name_starts_with=prefix))
-        # Uploading a document type replaces what was on file for it (a vendor fixing a returned application).
-        replaced_prefixes = {f"{prefix}{doc_type}_" for doc_type, *_ in staged}
-        replaced_blobs = [blob.name for blob in existing_blobs if blob.name.startswith(tuple(replaced_prefixes))]
+        # Uploading a document type replaces what was uploaded for it (a vendor fixing a returned application), unless the request
+        # says ?append=1: a type that takes several files (Other) then adds to what is there, up to its limit.
+        append = request.args.get("append") in ("1", "true")
+        if append:
+            for doc_type, (label, max_files) in DOCUMENT_TYPES.items():
+                incoming = sum(1 for item in staged if item[0] == doc_type)
+                present = sum(1 for blob in existing_blobs if blob.name.startswith(f"{prefix}{doc_type}_"))
+                if incoming and present + incoming > max_files:
+                    return jsonify({"error": f"{label}: attach at most {max_files} file(s)."}), 400
+        replaced_prefixes = set() if append else {f"{prefix}{doc_type}_" for doc_type, *_ in staged}
+        replaced_blobs = [blob.name for blob in existing_blobs if replaced_prefixes and blob.name.startswith(tuple(replaced_prefixes))]
         # Signed agreements share the folder but are not uploads (see agreements.AGREEMENT_DOC_TYPE): they do not count against the cap.
         agreement_prefix = f"{prefix}{agreements.AGREEMENT_DOC_TYPE}_"
         kept_blobs = [blob for blob in existing_blobs if not blob.name.startswith(agreement_prefix)]
@@ -1106,29 +1144,94 @@ def upload_vendor_documents(vendor_id):
     return jsonify({"documents": saved}), 201
 
 
+def _documents_on_file(container, vendor_id):
+    """The vendor's supporting documents in the container (agreements are not listed here). `blob_name` identifies one file."""
+    documents = []
+    for blob in container.list_blobs(name_starts_with=f"vendor_{vendor_id}/", include=["metadata"]):
+        metadata = blob.metadata or {}
+        if metadata.get("doc_type") == agreements.AGREEMENT_DOC_TYPE:
+            continue  # agreements are listed on the Agreement screen, not with the supporting documents
+        documents.append({
+            "type": metadata.get("doc_type"),
+            "original_name": unquote(metadata.get("original_name") or blob.name.rsplit("/", 1)[-1]),
+            "size": blob.size,
+            "uploaded_at": metadata.get("uploaded_at"),
+            "blob_name": blob.name,
+        })
+    return documents
+
+
 @app.get("/vendors/me/documents")
 @auth.vendor_required()
 def list_my_documents():
-    """The supporting documents already on file, so the form can show them and offer to replace them."""
+    """The supporting documents already uploaded, so the form can show them and offer to replace or remove them."""
     vendor_id = g.vendor["vendor_id"]
     container = _docs_container()
     if container is None:
         return jsonify({"documents": [], "storage_configured": False}), 200
-    documents = []
     try:
-        for blob in container.list_blobs(name_starts_with=f"vendor_{vendor_id}/", include=["metadata"]):
-            metadata = blob.metadata or {}
-            if metadata.get("doc_type") == agreements.AGREEMENT_DOC_TYPE:
-                continue  # agreements are listed on the Agreement screen, not with the supporting documents
-            documents.append({
-                "type": metadata.get("doc_type"),
-                "original_name": unquote(metadata.get("original_name") or blob.name.rsplit("/", 1)[-1]),
-                "size": blob.size,
-                "uploaded_at": metadata.get("uploaded_at"),
-            })
+        documents = _documents_on_file(container, vendor_id)
     except AzureError:
         app.logger.exception("Listing documents for vendor %s failed", vendor_id)
         return jsonify({"error": "Unable to load your documents right now."}), 502
+    return jsonify({"documents": documents, "storage_configured": True}), 200
+
+
+@app.get("/vendors/me/documents/content")
+@auth.vendor_required()
+def my_document_content():
+    """The bytes of one of the caller's own uploaded documents (?blob_name=..., the identifier from the listing), for the preview."""
+    vendor_id = g.vendor["vendor_id"]
+    blob_name = (request.args.get("blob_name") or "").strip()
+    # Only a file directly inside the caller's own folder can be named; anything else (another vendor, a path trick) is not found.
+    folder = f"vendor_{vendor_id}/"
+    if not blob_name.startswith(folder) or "/" in blob_name[len(folder):] or ".." in blob_name:
+        return jsonify({"error": "Document not found."}), 404
+    container = _docs_container()
+    if container is None:
+        return jsonify({"error": "Document storage is not configured."}), 503
+    try:
+        match = next((item for item in _documents_on_file(container, vendor_id) if item["blob_name"] == blob_name), None)
+        if match is None:  # also excludes the agreement files, which are not listed with the supporting documents
+            return jsonify({"error": "Document not found."}), 404
+        content = container.get_blob_client(blob_name).download_blob().readall()
+    except AzureError:
+        app.logger.exception("Reading a document for vendor %s failed", vendor_id)
+        return jsonify({"error": "Unable to load the document right now."}), 502
+    extension = Path(blob_name).suffix.lower()
+    response = Response(content, mimetype=DOCUMENT_CONTENT_TYPES.get(extension, "application/octet-stream"))
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
+@app.delete("/vendors/me/documents")
+@auth.vendor_required(auth.STAGE_DRAFT, auth.STAGE_RETURNED)
+@agreement_hold.write_guard
+def delete_my_document():
+    """Remove one uploaded supporting document ({doc_type, blob_name}, in the body or the query string)."""
+    data = request.get_json(silent=True)
+    data = data if isinstance(data, dict) else {}
+    doc_type = str(data.get("doc_type") or request.args.get("doc_type") or "").strip()
+    blob_name = str(data.get("blob_name") or request.args.get("blob_name") or "").strip()
+    if doc_type not in DOCUMENT_TYPES:
+        return jsonify({"error": "Unknown document type."}), 400
+    vendor_id = g.vendor["vendor_id"]
+    # Only this vendor's own file of that type can be named: nothing else in the container is reachable from here.
+    if not blob_name.startswith(f"vendor_{vendor_id}/{doc_type}_") or "/" in blob_name[len(f"vendor_{vendor_id}/"):]:
+        return jsonify({"error": "Document not found."}), 404
+    container = _docs_container()
+    if container is None:
+        return jsonify({"error": "Document storage is not configured."}), 503
+    try:
+        documents = _documents_on_file(container, vendor_id)
+        if not any(item["blob_name"] == blob_name and item["type"] == doc_type for item in documents):
+            return jsonify({"error": "Document not found."}), 404
+        container.delete_blob(blob_name)
+        documents = [item for item in documents if item["blob_name"] != blob_name]
+    except AzureError:
+        app.logger.exception("Removing a document for vendor %s failed", vendor_id)
+        return jsonify({"error": "Unable to remove the document. Please try again."}), 502
     return jsonify({"documents": documents, "storage_configured": True}), 200
 
 
@@ -1158,6 +1261,7 @@ def update_vendor():
 
 @app.post("/vendors/update-requests")
 @auth.vendor_required(auth.STAGE_ACTIVE)
+@agreement_hold.write_guard
 def create_update_request():
     data = request.get_json(silent=True) or {}
     vendor_id = data.get("vendor_id")
@@ -1267,7 +1371,7 @@ def check_vendor_email():
         cursor = conn.cursor(dictionary=True)
 
         cursor.execute(
-            "SELECT vendor_id FROM vendor WHERE LOWER(TRIM(email)) = %s AND LOWER(status) <> 'rejected' LIMIT 1",
+            f"SELECT vendor_id FROM vendor WHERE LOWER(TRIM(email)) = %s AND {EMAIL_HELD_SQL} LIMIT 1",
             (normalized_email,),
         )
         vendor = cursor.fetchone()
@@ -1456,6 +1560,10 @@ def check_vendor_pan():
 
     normalized_pan = pan.strip().upper()
 
+    if not pan_duplicate_check_enabled():
+        # TODO: re-enable after testing. While the switch is off no PAN is reported as already used.
+        return jsonify({"message": "PAN not found", "code": 200, "exists": False, "data": []}), 200
+
     conn = None
     cursor = None
     try:
@@ -1465,7 +1573,7 @@ def check_vendor_pan():
         # A vendor filling in their own form must not be told their own saved PAN is a duplicate.
         own_id = auth.current_vendor_id()
         cursor.execute(
-            "SELECT vendor_id FROM vendor WHERE UPPER(TRIM(pan)) = %s AND vendor_id <> %s AND LOWER(status) <> 'rejected' LIMIT 1",
+            f"SELECT vendor_id FROM vendor WHERE UPPER(TRIM(pan)) = %s AND vendor_id <> %s AND {PAN_CLAIMED_SQL} LIMIT 1",
             (normalized_pan, own_id if own_id is not None else -1),
         )
         vendor = cursor.fetchone()
@@ -1704,6 +1812,7 @@ def _insert_invoice_children(cursor, invoice_id, tax_rows, line_rows):
 
 @app.post("/invoices/ocr")
 @auth.vendor_required(auth.STAGE_ACTIVE)
+@agreement_hold.write_guard
 def upload_invoice_for_ocr():
     vendor_id = request.form.get("vendor_id", "").strip()
     invoice_file = request.files.get("invoices")
@@ -1902,6 +2011,7 @@ def get_invoice_return_reasons(invoice_id):
 
 @app.post("/invoices/<int:invoice_id>/replace")
 @auth.vendor_required(auth.STAGE_ACTIVE)
+@agreement_hold.write_guard
 def replace_invoice(invoice_id):
     invoice_file = request.files.get("invoices")
     if invoice_file is None or not invoice_file.filename:
@@ -1952,6 +2062,14 @@ def replace_invoice(invoice_id):
     try:
         conn = get_connection()
         cursor = conn.cursor()
+        # The invoice as it is now is kept as an earlier version first, in this same transaction: an invoice is never replaced
+        # without its history. Nothing here (or anywhere) deletes the old file from storage.
+        try:
+            invoice_versions.snapshot_before_replace(cursor, invoice_id, vendor_email, "vendor")
+        except Exception:  # noqa: BLE001 - any failure must stop the replace
+            conn.rollback()
+            app.logger.exception("Could not save the history of invoice %s before replacing it", invoice_id)
+            return jsonify({"error": "Unable to save the invoice history, so the invoice was not replaced."}), 500
         # Back to the start of the approval chain (the maker's queue) whoever returned it, with the G/L account and tax code
         # cleared for the maker to assign again; it then goes to the checker and, if needed, the authorizer as usual.
         cursor.execute(
@@ -2029,6 +2147,7 @@ _PREVIEW_LINE_COLUMNS = (
 
 @app.post("/invoices/<int:invoice_id>/replace-preview")
 @auth.vendor_required(auth.STAGE_ACTIVE)
+@agreement_hold.write_guard
 def preview_replacement_invoice(invoice_id):
     """Read a new file with the OCR service and return its details, so the vendor can compare them with the invoice
     being replaced before overwriting it. Nothing is saved: the invoice and its rows are untouched."""
@@ -2174,6 +2293,7 @@ agreements.configure(
     support_email=SUPPORT_EMAIL,
 )
 app.register_blueprint(agreements.bp)
+app.register_blueprint(invoice_versions.bp)
 
 
 if __name__ == "__main__":

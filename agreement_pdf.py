@@ -275,6 +275,17 @@ def build_agreement_pdf(terms, company_signature_png=None, vendor_signature_png=
                   f"{escape(vendor.get('address', ''))}, PAN <b>{escape(vendor.get('pan', ''))}</b>"
                   f"{', GSTIN <b>' + escape(vendor['gstin']) + '</b>' if vendor.get('gstin') else ''} (the \"<b>Vendor</b>\").", styles["party"]),
         Paragraph("The Company and the Vendor are each a \"Party\" and together the \"Parties\".", styles["base"]),
+        *(
+            [
+                Paragraph(
+                    f"This agreement is signed on {escape(terms.get('agreement_date', ''))} and takes effect from {escape(terms.get('effective_date', ''))}, "
+                    "the day after the previous agreement ended.",
+                    styles["base"],
+                )
+            ]
+            if terms.get("backdated")
+            else []
+        ),
         Spacer(1, 8),
     ]
     for clause in terms["clauses"]:

@@ -20,6 +20,7 @@ from azure.storage.blob import ContentSettings
 from flask import Blueprint, Response, g, jsonify, request
 from mysql.connector import Error as MySQLError
 
+import agreement_hold
 import agreement_pdf
 import auth
 from db import get_connection
@@ -967,3 +968,171 @@ def verify_agreement():
         "vendor_name": row["vendor_name"],
         "signed_at": _iso(row["signed_at"]),
     }), 200
+
+
+# --- renewal request ---------------------------------------------------------------------------------------
+# An active vendor whose agreement is ending (60 days or less) or has ended asks for a renewal. The request is recorded as
+# agreement_event rows on the vendor's most recent signed agreement (the checkers act on it in the enterprise app):
+#   renewal_requested {start_date, term_months, note, requested_by}   renewal_request_cancelled
+#   renewal_request_declined {reason}   renewal_request_fulfilled {agreement_id}   (the last two are written by the enterprise app)
+RENEWAL_OUTCOMES = {"renewal_request_declined": "declined", "renewal_request_fulfilled": "fulfilled", "renewal_request_cancelled": "cancelled"}
+MAX_START_AHEAD_DAYS = 400
+MIN_TERM_MONTHS, MAX_TERM_MONTHS = 1, 60
+NOTE_MAX = 500
+_RENEWAL_EVENTS_SQL = (
+    "SELECT e.event_type, e.detail, e.created_at, e.actor FROM agreement_event e JOIN vendor_agreement a ON a.agreement_id = e.agreement_id "
+    "WHERE a.vendor_id = %s AND e.event_type IN ('renewal_requested', 'renewal_request_cancelled', 'renewal_request_declined', "
+    "'renewal_request_fulfilled') ORDER BY e.event_id DESC"
+)
+
+
+def _default_term_months():
+    try:
+        return int(os.getenv("AGREEMENT_DEFAULT_TERM_MONTHS") or 24)
+    except ValueError:
+        return 24
+
+
+def renewal_window(signed_rows, today):
+    """(earliest start, end of the agreement in force). The earliest start is the day after the agreement in force ends while that end is
+    today or later, otherwise today. `signed_rows` are the signed agreements, newest version first, with start_iso / end_iso."""
+    for row in signed_rows:
+        start, end = _end_date(row.get("start_iso")), _end_date(row.get("end_iso"))
+        if start is not None and start <= today:
+            return (end + timedelta(days=1) if end is not None and end >= today else today), end
+    return today, None
+
+
+def _show(day):
+    return f"{day.day} {day.strftime('%b %Y')}"
+
+
+def resolve_renewal(start_date, term_months, signed_rows, today):
+    """(start, term in months) of a renewal request; ValueError with a readable message when it is not allowed."""
+    earliest, current_end = renewal_window(signed_rows, today)
+    if term_months is None:
+        term = _default_term_months()
+    elif isinstance(term_months, bool) or not isinstance(term_months, int) or not MIN_TERM_MONTHS <= term_months <= MAX_TERM_MONTHS:
+        raise ValueError(f"The term must be a whole number of months from {MIN_TERM_MONTHS} to {MAX_TERM_MONTHS}.")
+    else:
+        term = term_months
+    if start_date in (None, ""):
+        return earliest, term
+    start = _end_date(start_date) if isinstance(start_date, str) else None
+    if start is None:
+        raise ValueError("The start date must be a date (YYYY-MM-DD).")
+    if start < earliest:
+        if current_end is not None and current_end >= today:
+            raise ValueError(f"The new agreement can start only after the current agreement ends on {_show(current_end)} (earliest {_show(earliest)}).")
+        raise ValueError("The start date cannot be in the past.")
+    if start > earliest + timedelta(days=MAX_START_AHEAD_DAYS):
+        raise ValueError(f"The start date can be at most {MAX_START_AHEAD_DAYS} days after {_show(earliest)}.")
+    return start, term
+
+
+def _renewal_state(cursor, vendor_id, status):
+    """Everything the renewal endpoints need: the signed rows, today, eligibility, the open request and the last outcome."""
+    cursor.execute("SELECT NOW() AS db_now")
+    today = cursor.fetchone()["db_now"].date()
+    cursor.execute(agreement_hold.SIGNED_SQL, (vendor_id,))
+    signed = cursor.fetchall()
+    hold, expiry = agreement_hold.read_state(cursor, vendor_id, status, today)
+    eligible = bool(signed) and (hold["on_hold"] or bool(hold["released_until"]) or expiry is None or expiry["expiring"])
+    cursor.execute(_RENEWAL_EVENTS_SQL, (vendor_id,))
+    events = cursor.fetchall()
+    open_request = last_outcome = None
+    for index, event in enumerate(events):
+        try:
+            detail = _json(event.get("detail")) or {}
+        except (TypeError, ValueError):
+            detail = {}
+        if not isinstance(detail, dict):
+            detail = {}
+        if event["event_type"] == "renewal_requested":
+            if index == 0:
+                open_request = {
+                    "start_date": detail.get("start_date"), "term_months": detail.get("term_months"),
+                    "note": detail.get("note") or "", "requested_at": _iso(event.get("created_at")),
+                }
+        elif last_outcome is None:
+            last_outcome = {
+                "status": RENEWAL_OUTCOMES[event["event_type"]], "reason": str(detail.get("reason") or ""), "at": _iso(event.get("created_at")),
+            }
+    return {"today": today, "signed": signed, "eligible": eligible, "open": open_request, "last": last_outcome}
+
+
+def _renewal_payload(state):
+    earliest, current_end = renewal_window(state["signed"], state["today"])
+    return {
+        "can_request": state["eligible"] and state["open"] is None,
+        "min_start": earliest.isoformat(),
+        "max_start": (earliest + timedelta(days=MAX_START_AHEAD_DAYS)).isoformat(),
+        "default_term_months": _default_term_months(),
+        "current_end": current_end.isoformat() if current_end else None,
+        "open_request": state["open"],
+        "last_outcome": state["last"],
+    }
+
+
+@bp.get("/vendors/me/renewal")
+@auth.vendor_required(auth.STAGE_ACTIVE)
+def get_renewal():
+    try:
+        with _Db() as (_, cursor):
+            state = _renewal_state(cursor, g.vendor["vendor_id"], g.vendor["status"])
+    except MySQLError as err:
+        return _err(str(err), 500)
+    return jsonify(_renewal_payload(state)), 200
+
+
+@bp.post("/vendors/me/renewal-request")
+@auth.vendor_required(auth.STAGE_ACTIVE)
+def request_renewal():
+    vendor = g.vendor
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return _err("Request body must be JSON", 400)
+    note = data.get("note")
+    if note is not None and not isinstance(note, str):
+        return _err("The note must be text.", 400)
+    note = (note or "").strip()
+    if len(note) > NOTE_MAX:
+        return _err(f"The note can be at most {NOTE_MAX} characters.", 400)
+    try:
+        with _Db() as (conn, cursor):
+            state = _renewal_state(cursor, vendor["vendor_id"], vendor["status"])
+            if not state["signed"] or not state["eligible"]:
+                return _err("A renewal can be requested when your agreement is ending soon or has ended.", 409)
+            if state["open"] is not None:
+                return _err("You already have a renewal request waiting for our team.", 409)
+            try:
+                start, term = resolve_renewal(data.get("start_date"), data.get("term_months"), state["signed"], state["today"])
+            except ValueError as err:
+                return _err(str(err), 400)
+            _event(cursor, state["signed"][0]["agreement_id"], "renewal_requested", vendor["email"], _client_ip(),
+                   {"start_date": start.isoformat(), "term_months": term, "note": note, "requested_by": vendor["email"]})
+            conn.commit()
+            state = _renewal_state(cursor, vendor["vendor_id"], vendor["status"])
+    except MySQLError as err:
+        return _err(str(err), 500)
+    vendor_name, _ = _vendor_names(vendor["vendor_id"])
+    _notify("AGREEMENT_RENEWAL_REQUESTED_TEMPLATE", _checker_emails(), f"Vendor requested an agreement renewal - {vendor_name}",
+            {"vendor_name": vendor_name, "requested_start": start.isoformat(), "term_months": term, "note": note})
+    return jsonify({"message": "We have told our team.", **_renewal_payload(state)}), 201
+
+
+@bp.delete("/vendors/me/renewal-request")
+@auth.vendor_required(auth.STAGE_ACTIVE)
+def cancel_renewal_request():
+    vendor = g.vendor
+    try:
+        with _Db() as (conn, cursor):
+            state = _renewal_state(cursor, vendor["vendor_id"], vendor["status"])
+            if state["open"] is None or not state["signed"]:
+                return _err("There is no open renewal request to cancel.", 409)
+            _event(cursor, state["signed"][0]["agreement_id"], "renewal_request_cancelled", vendor["email"], _client_ip(), None)
+            conn.commit()
+            state = _renewal_state(cursor, vendor["vendor_id"], vendor["status"])
+    except MySQLError as err:
+        return _err(str(err), 500)
+    return jsonify({"message": "Your renewal request was cancelled.", **_renewal_payload(state)}), 200

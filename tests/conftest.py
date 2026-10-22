@@ -18,6 +18,7 @@ os.environ.setdefault("DB_USER", "x")
 os.environ.setdefault("DB_PASSWORD", "x")
 os.environ.setdefault("DB_NAME", "x")
 
+import agreement_hold  # noqa: E402
 import agreement_pdf  # noqa: E402,F401
 import agreements  # noqa: E402
 import app as portal  # noqa: E402
@@ -112,6 +113,19 @@ class FakeCursor:
                            "company_name": json.loads(r["terms_json"]).get("company", {}).get("name"),
                            "company_signatory_name": json.loads(r["terms_json"]).get("company", {}).get("signatory_name"),
                            "company_signatory_designation": json.loads(r["terms_json"]).get("company", {}).get("signatory_designation")} for r in rows]
+        elif "FROM vendor_agreement WHERE vendor_id = %s AND status = 'signed' ORDER BY version DESC" in s:
+            rows = sorted((r for r in st.agreements.values() if r["vendor_id"] == p[0] and r["status"] == "signed"), key=lambda r: -r["version"])
+            self._rows = [{"agreement_id": r["agreement_id"], "version": r["version"],
+                           "start_iso": json.loads(r["terms_json"])["start_iso"], "end_iso": json.loads(r["terms_json"])["end_iso"]} for r in rows]
+        elif s.startswith("SELECT e.event_type, e.detail FROM agreement_event e JOIN"):
+            mine = {a["agreement_id"] for a in st.agreements.values() if a["vendor_id"] == p[0]}
+            rows = [e for e in st.events if e["agreement_id"] in mine and e["event_type"] in ("hold_released", "hold_release_ended")]
+            self._rows = [{"event_type": rows[-1]["event_type"], "detail": rows[-1]["detail"]}] if rows else []
+        elif s.startswith("SELECT e.event_type, e.detail, e.created_at, e.actor FROM agreement_event e JOIN"):
+            mine = {a["agreement_id"] for a in st.agreements.values() if a["vendor_id"] == p[0]}
+            kinds = ("renewal_requested", "renewal_request_cancelled", "renewal_request_declined", "renewal_request_fulfilled")
+            rows = [e for e in st.events if e["agreement_id"] in mine and e["event_type"] in kinds]
+            self._rows = [dict(e) for e in reversed(rows)]
         elif "FROM vendor_agreement WHERE vendor_id = %s ORDER BY version DESC LIMIT 1" in s:
             rows = sorted((r for r in st.agreements.values() if r["vendor_id"] == p[0]), key=lambda r: -r["version"])
             self._rows = [dict(rows[0])] if rows else []
@@ -150,7 +164,7 @@ class FakeCursor:
                 self.rowcount = 1
         elif s.startswith("INSERT INTO agreement_event"):
             st.events.append({"agreement_id": p[0], "event_type": p[1], "actor": p[2],
-                              "detail": json.loads(p[3]) if p[3] else None, "ip": p[4]})
+                              "detail": json.loads(p[3]) if p[3] else None, "ip": p[4], "created_at": st.now})
         elif s.startswith("UPDATE vendor_agreement SET first_viewed_at"):
             r = st.agreements[p[0]]
             if r["first_viewed_at"] is None:
@@ -265,6 +279,10 @@ def env(monkeypatch):
     e.verified_error = None  # what the service's status says: None = verified
     monkeypatch.setattr(agreements, "get_connection", e.db.connect)
     monkeypatch.setattr(auth, "get_connection", e.db.connect)
+    monkeypatch.setattr(agreement_hold, "get_connection", e.db.connect)
+    monkeypatch.delenv("AGREEMENT_EXPIRY_HOLD", raising=False)
+    monkeypatch.delenv("AGREEMENT_DEFAULT_TERM_MONTHS", raising=False)
+    monkeypatch.delenv("AGREEMENT_RENEWAL_REQUESTED_TEMPLATE", raising=False)
 
     def ev_request(method, path, **kwargs):
         e.verification_calls.append((method, path, kwargs))
