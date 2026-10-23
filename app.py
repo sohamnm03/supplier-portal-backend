@@ -1060,12 +1060,23 @@ def cancel_change_request():
     conn = cursor = None
     try:
         conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE vendor SET status = %s, correction_fields = NULL WHERE vendor_id = %s AND status = %s",
-            (restore, vendor_id, g.vendor["status"]),
-        )
-        changed = cursor.rowcount
+        cursor = conn.cursor(dictionary=True)
+        # A change request raised by "Something is wrong" at the agreement's details review goes back to that very step: the SAME
+        # agreement awaits the vendor's signature again (in one transaction). Anything else is withdrawn as before.
+        outcome = None
+        if str(g.vendor["status"]).strip().lower() == auth.STATUS_CHANGE_REQ_CHECKER:
+            outcome = agreements.restore_after_change_request_cancel(cursor, vendor_id, agreements._client_ip(), g.vendor.get("email"))
+        if outcome == "restored":
+            changed = 1
+        elif outcome == "conflict":
+            conn.rollback()
+            changed = 0
+        else:
+            cursor.execute(
+                "UPDATE vendor SET status = %s, correction_fields = NULL WHERE vendor_id = %s AND status = %s",
+                (restore, vendor_id, g.vendor["status"]),
+            )
+            changed = cursor.rowcount
         conn.commit()
     except MySQLError as err:
         return jsonify({"error": str(err)}), 500

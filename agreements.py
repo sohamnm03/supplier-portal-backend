@@ -257,6 +257,40 @@ def _decline_step(cursor, agreement_id):
     return _text(detail.get("at_step"))
 
 
+def restore_after_change_request_cancel(cursor, vendor_id, client_ip=None, actor=None):
+    """The vendor withdraws a change request that "Something is wrong" at the agreement's details review raised: put them back at that step.
+
+    Returns 'restored' (the SAME agreement is awaiting signature again, vendor.status agreement_sent, correction_fields cleared, event
+    'change_request_cancelled' appended), None when this is not that situation (the change request was raised another way, the decline
+    was at the signing step, or the signing link has expired meanwhile: the caller does the ordinary withdraw), or 'conflict' when
+    the vendor or agreement moved on during the call (nothing was changed). The caller commits; call it in the caller's transaction."""
+    cursor.execute(
+        "SELECT agreement_id, status, decline_reason, (expires_at IS NULL OR expires_at >= NOW()) AS live FROM vendor_agreement "
+        "WHERE vendor_id = %s ORDER BY version DESC LIMIT 1 FOR UPDATE",
+        (vendor_id,),
+    )
+    row = cursor.fetchone()
+    if not row or row["status"] != "declined" or not row["live"]:
+        return None
+    if _decline_step(cursor, row["agreement_id"]) != "review":
+        return None
+    cursor.execute(
+        "UPDATE vendor_agreement SET status = 'sent', declined_at = NULL, decline_reason = NULL "
+        "WHERE agreement_id = %s AND vendor_id = %s AND status = 'declined' AND (expires_at IS NULL OR expires_at >= NOW())",
+        (row["agreement_id"], vendor_id),
+    )
+    if cursor.rowcount != 1:
+        return "conflict"
+    cursor.execute(
+        "UPDATE vendor SET status = 'agreement_sent', correction_fields = NULL WHERE vendor_id = %s AND status = 'change_req_checker'",
+        (vendor_id,),
+    )
+    if cursor.rowcount != 1:
+        return "conflict"
+    _event(cursor, row["agreement_id"], "change_request_cancelled", actor, client_ip, {"previous_decline_reason": row.get("decline_reason")})
+    return "restored"
+
+
 def _snapshot_of(terms):
     snapshot = terms.get("details_snapshot")
     return snapshot if isinstance(snapshot, dict) else None

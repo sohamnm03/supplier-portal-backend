@@ -86,8 +86,8 @@ class InvoiceCursor:
             self._set([{"id": row["id"], "submission_round": row["submission_round"]}] if row and row["vendor_id"] == p[1] else [])
         elif s == "SELECT status FROM invoices WHERE id = %s":
             self._set([{"status": db.invoices[p[0]]["status"]}])
-        elif s.startswith("SELECT vendor_legal_name FROM vendor"):
-            self._set([{"vendor_legal_name": "Vendor Pvt Ltd"}])
+        elif s.startswith("SELECT vendor_legal_name"):
+            self._set([{"vendor_legal_name": "Vendor Pvt Ltd", "msme_status": "Not registered", "udyam_number": None}])
         elif s.startswith("SELECT * FROM invoices WHERE id = %s"):
             self._set([db.invoices[p[0]]] if p[0] in db.invoices else [])
         elif s.startswith("SELECT * FROM invoice_tax_details"):

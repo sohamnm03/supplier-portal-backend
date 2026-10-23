@@ -126,6 +126,20 @@ class FakeCursor:
             kinds = ("renewal_requested", "renewal_request_cancelled", "renewal_request_declined", "renewal_request_fulfilled")
             rows = [e for e in st.events if e["agreement_id"] in mine and e["event_type"] in kinds]
             self._rows = [dict(e) for e in reversed(rows)]
+        elif s.startswith("SELECT agreement_id, status, decline_reason, (expires_at IS NULL OR expires_at >= NOW()) AS live FROM vendor_agreement"):
+            rows = sorted((r for r in st.agreements.values() if r["vendor_id"] == p[0]), key=lambda r: -r["version"])
+            self._rows = [{"agreement_id": rows[0]["agreement_id"], "status": rows[0]["status"], "decline_reason": rows[0].get("decline_reason"),
+                           "live": rows[0]["expires_at"] is None or rows[0]["expires_at"] >= st.now}] if rows else []
+        elif s.startswith("UPDATE vendor_agreement SET status = 'sent', declined_at = NULL"):
+            r = st.agreements[p[0]]
+            if r["vendor_id"] == p[1] and r["status"] == "declined" and (r["expires_at"] is None or r["expires_at"] >= st.now):
+                r.update(status="sent", declined_at=None, decline_reason=None)
+                self.rowcount = 1
+        elif s.startswith("UPDATE vendor SET status = 'agreement_sent', correction_fields = NULL"):
+            v = st.vendors[p[0]]
+            if v["status"] == "change_req_checker":
+                v.update(status="agreement_sent", correction_fields=None)
+                self.rowcount = 1
         elif "FROM vendor_agreement WHERE vendor_id = %s ORDER BY version DESC LIMIT 1" in s:
             rows = sorted((r for r in st.agreements.values() if r["vendor_id"] == p[0]), key=lambda r: -r["version"])
             self._rows = [dict(rows[0])] if rows else []
@@ -185,7 +199,7 @@ class FakeCursor:
                 r.update(status="declined", declined_at=st.now, decline_reason=reason)
                 self.rowcount = 1
         elif s.startswith("UPDATE vendor SET status = %s, correction_fields"):
-            new, keys, vid, old = p
+            new, keys, vid, old = (p[0], None, p[1], p[2]) if "correction_fields = NULL" in s else p
             v = st.vendors[vid]
             if v["status"] == old:
                 v.update(status=new, correction_fields=keys)
