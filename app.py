@@ -21,6 +21,7 @@ import agreement_hold
 import agreements
 import auth
 import invoice_versions
+import phone_verification
 import rejections
 import update_requests
 import verification
@@ -658,7 +659,7 @@ def _vendor_with_progress(vendor_id):
 
 @app.post("/vendors/signup")
 def signup_vendor():
-    """Create a vendor account from a verified email and a phone number, and email the login credentials."""
+    """Create a vendor account from a verified email and a verified phone number, and email the login credentials."""
     data = request.get_json(silent=True) or {}
     email = str(data.get("email") or "").strip()
     contact_no = str(data.get("contact_no") or "").strip()
@@ -672,6 +673,11 @@ def signup_vendor():
     verification_error = _verified_email_error(data.get("verification_id"), email)
     if verification_error:
         return jsonify({"error": verification_error[0]}), verification_error[1]
+
+    # ...and the phone number through the WhatsApp code, for exactly the number being registered.
+    phone_error = phone_verification.verified_phone_error(data.get("phone_verification_id"), contact_no)
+    if phone_error:
+        return jsonify({"error": phone_error[0]}), phone_error[1]
 
     if _find_duplicate_identity({"email": email}):
         return jsonify({
@@ -2410,6 +2416,7 @@ agreements.configure(
 )
 app.register_blueprint(agreements.bp)
 app.register_blueprint(invoice_versions.bp)
+app.register_blueprint(phone_verification.bp)
 
 
 if __name__ == "__main__":
