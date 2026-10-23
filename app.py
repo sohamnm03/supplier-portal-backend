@@ -228,6 +228,11 @@ def _validate_vendor_values(values, existing=None, draft=False):
         return "cin must be a 21-character CIN"
     if len(str(final.get("udyam_number") or "").strip()) > 30:
         return "udyam_number is too long"
+    # The vendor is created in SAP from this number, and SAP's BankAccount holds 18 characters: a longer or non-numeric one is
+    # refused there. Checked on submit and on a change request (when the number is being written), not on a draft, which may be partial.
+    account = str(values.get("bank_account_no") or "").strip()
+    if not draft and account and not re.fullmatch(r"\d{9,18}", account):
+        return "bank_account_no must be 9 to 18 digits (digits only)"
     return None
 
 

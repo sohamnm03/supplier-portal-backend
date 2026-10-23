@@ -614,7 +614,12 @@ def verify_code(agreement_id):
             except ValueError:
                 return _err("Email verification returned an unexpected response.", 502)
             body = body if isinstance(body, dict) else {}
-            if not upstream.ok or body.get("success") is False:
+            refused = not upstream.ok or body.get("success") is False
+            # The link in the same email may already have verified this address (the service then refuses the code as "already
+            # verified"). The service's status is the truth: if it says verified for this email, that is a success, not a wrong code.
+            if refused and deps["verified_email_error"](last["code_hash"], vendor["email"]) is None:
+                refused = False
+            if refused:
                 status = upstream.status_code if upstream.status_code in (400, 410, 429, 503) else 400
                 if upstream.ok:
                     status = 400
@@ -624,6 +629,32 @@ def verify_code(agreement_id):
     except MySQLError as err:
         return _err(str(err), 500)
     return jsonify({"success": True, "verified": True, "message": "Code confirmed."}), 200
+
+
+@bp.get("/vendors/me/agreements/<int:agreement_id>/code-status")
+@auth.vendor_required(*VIEW_STAGES)
+def code_status(agreement_id):
+    """Whether the email code just sent has been confirmed, by typing it or by opening the link in the same email (which the shared
+    service records on its side). The signing page polls this so the link works without typing anything; the shared service stays
+    the source of truth, exactly as it is when the agreement is signed."""
+    vendor = g.vendor
+    try:
+        with _Db() as (_, cursor):
+            row = _load(cursor, vendor["vendor_id"], agreement_id)
+            if row is None:
+                return _err("Agreement not found.", 404)
+            problem = _state_error(row)
+            if problem:
+                return _err(*problem)
+            last = _latest_otp(cursor, agreement_id)
+    except MySQLError as err:
+        return _err(str(err), 500)
+    if not last or last["used_at"] is not None or not last["live"]:
+        return jsonify({"verified": False}), 200
+    if str(last["sent_to"] or "").strip().lower() != str(vendor["email"] or "").strip().lower():
+        return jsonify({"verified": False}), 200
+    # Anything but a clear "verified" (including the service being unreachable) simply reads as "not yet": the next poll asks again.
+    return jsonify({"verified": deps["verified_email_error"](last["code_hash"], vendor["email"]) is None}), 200
 
 
 # --- routes: sign / decline -------------------------------------------------------------------------------

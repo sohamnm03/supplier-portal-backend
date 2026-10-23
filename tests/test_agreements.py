@@ -151,6 +151,7 @@ def test_verify_code_attempt_limit(env):
     env.state.add_agreement(1, 1, "sent")
     env.db.commit_now()
     env.send_code()
+    env.verified_error = ("Verify your email address before submitting.", 403)  # the address is not verified, so a wrong code stays wrong
     env.verify_answer = FakeResponse({"success": False, "message": "Incorrect code"}, 400)
     for n in range(5):
         r = env.client.post("/vendors/me/agreements/1/verify-code", headers=env.headers, json={"otp": "000000"})
@@ -170,6 +171,32 @@ def test_verify_code_success_logs_event(env):
     assert r.status_code == 200 and r.get_json()["verified"] is True
     assert env.state.events[-1]["event_type"] == "code_verified"
     assert env.client.post("/vendors/me/agreements/1/verify-code", headers=env.headers, json={}).status_code == 400
+
+
+def test_typing_the_code_after_the_link_was_opened_is_a_success(env):
+    env.state.add_agreement(1, 1, "sent")
+    env.db.commit_now()
+    env.send_code()
+    env.verify_answer = FakeResponse({"success": False, "message": "This email is already verified."}, 409)
+    env.verified_error = None  # the link was opened first, so the service reports the address verified
+    r = env.client.post("/vendors/me/agreements/1/verify-code", headers=env.headers, json={"otp": "123456"})
+    assert r.status_code == 200 and r.get_json()["verified"] is True
+    env.verified_error = ("Verify your email address before submitting.", 403)  # a genuinely wrong code is still refused
+    r = env.client.post("/vendors/me/agreements/1/verify-code", headers=env.headers, json={"otp": "000000"})
+    assert r.status_code == 400
+
+
+def test_code_status_follows_the_link_being_opened(env):
+    env.state.add_agreement(1, 1, "sent")
+    env.db.commit_now()
+    url = "/vendors/me/agreements/1/code-status"
+    assert env.client.get(url, headers=env.headers).get_json() == {"verified": False}  # no code requested yet
+    env.send_code()
+    env.verified_error = ("Verify your email address before submitting.", 403)
+    assert env.client.get(url, headers=env.headers).get_json() == {"verified": False}  # sent, not confirmed
+    env.verified_error = None  # the link in the email was opened: the service now reports it verified
+    assert env.client.get(url, headers=env.headers).get_json() == {"verified": True}
+    assert env.client.get("/vendors/me/agreements/99/code-status", headers=env.headers).status_code == 404
 
 
 def test_verify_code_without_code_requested(env):
