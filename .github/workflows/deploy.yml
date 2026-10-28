@@ -1,0 +1,79 @@
+name: Deploy backend
+
+# Every push to main runs the tests and, if they pass, deploys to the App Service.
+# Azure sign-in is passwordless (OIDC): the ids below are identifiers, not secrets.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+env:
+  AZURE_CLIENT_ID: 19d7ec60-0d20-48cf-9b14-c0f69bc7d37a
+  AZURE_TENANT_ID: 20f14c78-01b4-476e-92c2-416b34c32de8
+  AZURE_SUBSCRIPTION_ID: 4e42ddef-bc2e-4f27-99d9-3f2a6daff370
+  RESOURCE_GROUP: FS-Quad
+  WEBAPP_NAME: fs-quad-vendor-selfservice-portal
+  WEBAPP_URL: https://fs-quad-vendor-selfservice-portal-a7d0bvb5b6faerf8.centralindia-01.azurewebsites.net
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt pytest
+      - run: python -m pytest -q
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tracked files only, so .env and venv can never end up in the package.
+      - name: Package
+        run: git archive --format=zip --output "$RUNNER_TEMP/backend.zip" HEAD
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      # --track-status false: the CLI's startup tracking reports a failure after 10 minutes even when the site is
+      # up. The deploy itself still waits for the Oryx build and fails on a build error; the smoke test checks the site.
+      - name: Deploy to App Service
+        run: |
+          az webapp deploy \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$WEBAPP_NAME" \
+            --src-path "$RUNNER_TEMP/backend.zip" \
+            --type zip \
+            --track-status false
+
+      # An empty send must come back as a 400 JSON error: that proves the app booted and routes requests.
+      - name: Smoke test
+        run: |
+          for attempt in $(seq 1 20); do
+            code=$(curl -s -o response.json -w '%{http_code}' -X POST "$WEBAPP_URL/vendors/phone-verification/send" \
+              -H 'Content-Type: application/json' -d '{}' || true)
+            if [ "$code" = "400" ] && grep -q 'valid phone number' response.json; then
+              echo "Site is up (attempt $attempt)"
+              exit 0
+            fi
+            echo "Attempt $attempt: HTTP $code, retrying in 15s"
+            sleep 15
+          done
+          echo "Smoke test failed"
+          cat response.json || true
+          exit 1
