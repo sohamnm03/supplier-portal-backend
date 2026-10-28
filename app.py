@@ -28,8 +28,10 @@ import verification
 from db import get_connection
 
 app = Flask(__name__)
-# Any local dev port: Vite moves to the next free port (5174, ...) when 5173 is already taken.
-CORS(app, origins=[r"http://(localhost|127\.0\.0\.1):\d+"])
+# Any local dev port: Vite moves to the next free port (5174, ...) when 5173 is already taken. CORS_ORIGINS adds the
+# deployed frontend(s): exact origins, comma-separated, e.g. https://<account>.z29.web.core.windows.net
+CORS_ORIGINS = [origin.strip().rstrip("/") for origin in os.getenv("CORS_ORIGINS", "").split(",") if origin.strip()]
+CORS(app, origins=[r"http://(localhost|127\.0\.0\.1):\d+", *CORS_ORIGINS])
 
 # Deployed shared-services API (email + invoice OCR). Override with SHARED_SERVICES_URL in .env if needed.
 SHARED_SERVICES_URL = os.getenv("SHARED_SERVICES_URL", "https://fs-quad-shared.azurewebsites.net").rstrip("/")
@@ -37,7 +39,8 @@ EMAIL_API_URL = f"{SHARED_SERVICES_URL}/api/email/send"
 INVOICE_OCR_API_URL = f"{SHARED_SERVICES_URL}/api/invoice/ocr"
 EMAIL_VERIFICATION_API_URL = f"{SHARED_SERVICES_URL}/api/email-verification"
 
-FRONTEND_BASE_URL = "http://localhost:5173/"
+# Where vendors sign in (the login link in the emails). Set FRONTEND_BASE_URL to the deployed frontend.
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:5173").rstrip("/") + "/"
 SUPPORT_EMAIL = "support@fourthsignal.com"
 MAKER_EMAIL = "soham.m@fourthsignal.com"
 REVIEW_DAYS = 3
