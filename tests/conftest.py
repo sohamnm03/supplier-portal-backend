@@ -307,8 +307,11 @@ def env(monkeypatch):
     monkeypatch.setitem(agreements.deps, "email_verification_request", ev_request)
     monkeypatch.setitem(agreements.deps, "verified_email_error", lambda vid, email: e.verified_error)
     monkeypatch.setitem(agreements.deps, "docs_container", lambda: e.container)
+    e.email_attachments = []  # (to, template, attachments) for each email sent with files
     monkeypatch.setitem(agreements.deps, "send_email",
-                        lambda to, subject, template, params: e.emails.append((to, subject, template, params)) or True)
+                        lambda to, subject, template, params, attachments=None: (
+                            e.emails.append((to, subject, template, params)),
+                            attachments and e.email_attachments.append((to, template, attachments))) and True)
     e.change_emails = []
     monkeypatch.setitem(agreements.deps, "field_master", lambda has_gstin: {"pan": {"field_key": "pan", "field_label": "PAN"}, "ifsc": {"field_key": "ifsc", "field_label": "IFSC"}})
     monkeypatch.setitem(agreements.deps, "change_request_email", lambda vendor, status, labels: e.change_emails.append((status, labels)))

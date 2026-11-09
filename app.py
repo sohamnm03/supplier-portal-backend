@@ -357,8 +357,9 @@ def generate_password():
     return password, hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 
-def _send_email(to, subject, template_name, params, cc=None):
-    """Call the shared email service. Never raises: a failed email must not fail the request."""
+def _send_email(to, subject, template_name, params, cc=None, attachments=None):
+    """Call the shared email service. Never raises: a failed email must not fail the request.
+    `attachments` is a list of {"filename", "content_type", "content_base64"} (the service allows 10 MB in total)."""
     body = {
         "to": to,
         "subject": subject,
@@ -367,6 +368,8 @@ def _send_email(to, subject, template_name, params, cc=None):
     }
     if cc:
         body["cc"] = cc
+    if attachments:
+        body["attachments"] = attachments
     try:
         requests.post(EMAIL_API_URL, json=body, timeout=10).raise_for_status()
         return True

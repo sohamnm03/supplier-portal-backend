@@ -1,3 +1,4 @@
+import base64
 from datetime import timedelta
 
 import pytest
@@ -240,10 +241,39 @@ def test_sign_onboarding_happy_path(env, monkeypatch):
     assert len(env.container.uploads) == 1
 
 
-def test_sign_emails_skipped_when_templates_empty(env):
+def test_sign_emails_skipped_when_templates_are_set_blank(env, monkeypatch):
+    monkeypatch.setenv("VENDOR_AGREEMENT_SIGNED_TEMPLATE", "")
+    monkeypatch.setenv("VENDOR_AGREEMENT_SIGNED_NOTICE_TEMPLATE", "")
     prepared_onboarding(env)
     assert env.client.post("/vendors/me/agreements/1/sign", headers=env.headers, json=env.sign_body()).status_code == 200
     assert env.emails == []
+
+
+def test_signing_emails_every_checker_the_signed_pdf_with_no_env_config(env):
+    # Nothing is set: the checker notice uses its default template; the vendor's own confirmation (no default) is not sent.
+    prepared_onboarding(env)
+    assert env.client.post("/vendors/me/agreements/1/sign", headers=env.headers, json=env.sign_body()).status_code == 200
+
+    assert sorted(m[0] for m in env.emails) == ["checker1@acme.test", "checker2@acme.test"]
+    assert {m[2] for m in env.emails} == {"vendor_agreement_signed_notice"}
+    # The params are exactly what vendor_agreement_signed_notice.html needs (ven-shared-services 400s on a missing one).
+    assert set(env.emails[0][3]) == {"vendor_name", "agreement_no", "signed_at", "review_url"}
+    assert sorted(a[0] for a in env.email_attachments) == ["checker1@acme.test", "checker2@acme.test"]
+    for _, _, attachments in env.email_attachments:
+        assert len(attachments) == 1 and attachments[0]["filename"] == "AGR-2026-00001_signed.pdf"
+        assert attachments[0]["content_type"] == "application/pdf"
+        # It is the very PDF that was filed, not a rebuilt copy.
+        filed = env.container.blobs[env.state.agreements[1]["signed_pdf_path"]]
+        assert base64.b64decode(attachments[0]["content_base64"]) == filed
+
+
+def test_the_vendors_own_signed_confirmation_carries_no_attachment(env, monkeypatch):
+    monkeypatch.setenv("VENDOR_AGREEMENT_SIGNED_TEMPLATE", "t_signed")
+    prepared_onboarding(env)
+    assert env.client.post("/vendors/me/agreements/1/sign", headers=env.headers, json=env.sign_body()).status_code == 200
+
+    assert "v@vendor.test" in [m[0] for m in env.emails]
+    assert "v@vendor.test" not in [a[0] for a in env.email_attachments]
 
 
 def test_sign_renewal_leaves_vendor_status(env):
@@ -742,3 +772,20 @@ def test_agreements_do_not_count_against_the_upload_cap(env, monkeypatch):
                         data={"pan": (io.BytesIO(b"%PDF-1.4 pan"), "pan.pdf")}, content_type="multipart/form-data")
     assert r.status_code == 201, r.get_json()
     assert len(folder.uploaded) == 1 and folder.deleted == []
+
+
+def test_send_email_puts_attachments_in_the_request_body_only_when_given(monkeypatch):
+    bodies = []
+
+    class Ok:
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(portal.requests, "post", lambda url, json=None, timeout=None: bodies.append(json) or Ok())
+    files = [{"filename": "a.pdf", "content_type": "application/pdf", "content_base64": "JVBERi0="}]
+
+    assert portal._send_email("a@x.test", "s", "t", {}, attachments=files) is True
+    assert portal._send_email("a@x.test", "s", "t", {}) is True
+
+    assert bodies[0]["attachments"] == files
+    assert "attachments" not in bodies[1]

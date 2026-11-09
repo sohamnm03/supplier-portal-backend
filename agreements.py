@@ -35,6 +35,8 @@ OTP_VALID_MINUTES = 10
 NAME_MIN, NAME_MAX = 2, 150
 REASON_MIN, REASON_MAX = 3, 500
 CHECKER_GROUP = "CHECKER"
+# ven-shared-services template for the checkers' "vendor signed" email (VENDOR_AGREEMENT_SIGNED_NOTICE_TEMPLATE overrides it; set blank to turn it off).
+SIGNED_NOTICE_DEFAULT_TEMPLATE = "vendor_agreement_signed_notice"
 SIGNATURE_METHODS = {"draw": "Drawn signature", "type": "Typed signature", "upload": "Uploaded signature image"}
 # Blob metadata doc_type of an agreement filed in the vendor's documents folder (the enterprise app files the unsigned copy the same way).
 AGREEMENT_DOC_TYPE = "agreement"
@@ -684,17 +686,26 @@ def _checker_emails():
     return deps["group_emails"](CHECKER_GROUP, deps.get("maker_email"))
 
 
-def _notify(env_name, recipients, subject, params):
-    """Send through the shared email service; skipped (INFO) while the template setting is empty. Never raises."""
-    template = (os.getenv(env_name) or "").strip()
+def _notify(env_name, recipients, subject, params, attachments=None, default=""):
+    """Send through the shared email service, one email per recipient. The template comes from the env setting; when that is unset the
+    `default` is used, and when it is set but blank the email is skipped (INFO). Never raises."""
+    template = os.getenv(env_name)
+    template = (default if template is None else template).strip()
     if not template:
         log.info("Agreement email skipped: %s is not set (%s)", env_name, subject)
         return
     for recipient in recipients:
         try:
-            deps["send_email"](recipient, subject, template, params)
+            if attachments:
+                deps["send_email"](recipient, subject, template, params, attachments=attachments)
+            else:
+                deps["send_email"](recipient, subject, template, params)
         except Exception:  # an email problem must never fail the request
             log.exception("Agreement email '%s' to %s failed", template, recipient)
+
+
+def _pdf_attachment(filename, content):
+    return {"filename": filename, "content_type": "application/pdf", "content_base64": base64.b64encode(content).decode("ascii")}
 
 
 def _vendor_names(vendor_id):
@@ -831,8 +842,10 @@ def sign_agreement(agreement_id):
     base = deps.get("frontend_url")
     _notify("VENDOR_AGREEMENT_SIGNED_TEMPLATE", [email], f"Agreement {row['agreement_no']} signed",
             {"vendor_name": vendor_name, "agreement_no": row["agreement_no"], "signed_at": now_text, "portal_url": base})
+    # The checkers get the signed PDF itself (the very bytes just filed in storage), so they need not open the portal to read it.
     _notify("VENDOR_AGREEMENT_SIGNED_NOTICE_TEMPLATE", _checker_emails(), f"Vendor signed agreement - {vendor_name}",
-            {"vendor_name": vendor_name, "agreement_no": row["agreement_no"], "signed_at": now_text, "review_url": base})
+            {"vendor_name": vendor_name, "agreement_no": row["agreement_no"], "signed_at": now_text, "review_url": base},
+            attachments=[_pdf_attachment(f"{row['agreement_no']}_signed.pdf", pdf)], default=SIGNED_NOTICE_DEFAULT_TEMPLATE)
     mine = next((item for item in signed_items if item["agreement_id"] == agreement_id), None)
     return jsonify({
         "message": "Agreement signed.",
